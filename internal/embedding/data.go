@@ -1,0 +1,108 @@
+//go:build multiplexer
+
+package embedding
+
+import (
+	"fmt"
+	"runtime"
+)
+
+// NOTE: This version must be updated at the same time as the version in the
+// Makefile.
+const (
+	v3Version  = "v3.13.0"
+	v4Version  = "v4.1.0"
+	v5Version  = "v5.0.12"
+	v6Version  = "v6.4.10"
+	v7Version  = "v7.0.3-mocha"
+	v8Version  = "v8.0.8"
+	v9Version  = "v9.0.8"
+	v10Version = "v10.5.0"
+)
+
+// CelestiaAppV3 returns the compressed platform specific Celestia binary and
+// the version.
+func CelestiaAppV3() (version string, compressedBinary []byte, err error) {
+	// Check if we actually have binary data
+	if len(v3binaryCompressed) == 0 {
+		return "", nil, fmt.Errorf("no binary data available for platform %s", platform())
+	}
+
+	return v3Version, v3binaryCompressed, nil
+}
+
+// CelestiaAppV4 returns the compressed platform specific Celestia binary and
+// the version.
+func CelestiaAppV4() (version string, compressedBinary []byte, err error) {
+	if len(v4binaryCompressed) == 0 {
+		return "", nil, fmt.Errorf("no binary data available for platform %s", platform())
+	}
+
+	return v4Version, v4binaryCompressed, nil
+}
+
+// CelestiaAppV5 returns the compressed platform specific Celestia binary and
+// the version.
+func CelestiaAppV5() (version string, compressedBinary []byte, err error) {
+	if len(v5binaryCompressed) == 0 {
+		return "", nil, fmt.Errorf("no binary data available for platform %s", platform())
+	}
+
+	return v5Version, v5binaryCompressed, nil
+}
+
+// CelestiaAppV6 returns the compressed platform specific Celestia binary and
+// the version.
+func CelestiaAppV6() (version string, compressedBinary []byte, err error) {
+	if len(v6binaryCompressed) == 0 {
+		return "", nil, fmt.Errorf("no binary data available for platform %s", platform())
+	}
+
+	return v6Version, v6binaryCompressed, nil
+}
+
+// CelestiaAppV7 returns the compressed platform specific Celestia binary and
+// the version.
+func CelestiaAppV7() (version string, compressedBinary []byte, err error) {
+	if len(v7binaryCompressed) == 0 {
+		return "", nil, fmt.Errorf("no binary data available for platform %s", platform())
+	}
+
+	return v7Version, v7binaryCompressed, nil
+}
+
+// CelestiaAppV8 returns the compressed platform specific Celestia binary and
+// the version.
+func CelestiaAppV8() (version string, compressedBinary []byte, err error) {
+	if len(v8binaryCompressed) == 0 {
+		return "", nil, fmt.Errorf("no binary data available for platform %s", platform())
+	}
+
+	return v8Version, v8binaryCompressed, nil
+}
+
+// CelestiaAppV9 returns the compressed platform specific Celestia binary and
+// the version.
+func CelestiaAppV9() (version string, compressedBinary []byte, err error) {
+	if len(v9binaryCompressed) == 0 {
+		return "", nil, fmt.Errorf("no binary data available for platform %s", platform())
+	}
+
+	return v9Version, v9binaryCompressed, nil
+}
+
+// CelestiaAppV10 returns the compressed platform specific Celestia binary and
+// the version.
+func CelestiaAppV10() (version string, compressedBinary []byte, err error) {
+	if len(v10binaryCompressed) == 0 {
+		return "", nil, fmt.Errorf("no binary data available for platform %s", platform())
+	}
+
+	return v10Version, v10binaryCompressed, nil
+}
+
+// platform returns a string representing the current operating system and architecture
+// This is useful for identifying platform-specific binaries or configurations.
+func platform() string {
+	return runtime.GOOS + "_" + runtime.GOARCH
+}

@@ -1,0 +1,540 @@
+VERSION := $(shell \
+	checked_out=$$(git reflog -1 --format='%gs' 2>/dev/null | sed -nE 's,^checkout: moving from .* to (refs/)?(tags/)?(.+),\3,p'); \
+	if [ -n "$$checked_out" ] && git tag --points-at HEAD | grep -qxF "$$checked_out"; then \
+		echo "$$checked_out" | sed 's/^v//'; \
+	else \
+		git describe --tags --always --match "v*" | sed 's/^v//'; \
+	fi \
+)
+COMMIT := $(shell git rev-parse --short HEAD)
+CELESTIA_TAG := $(shell git rev-parse --short=8 HEAD)
+export CELESTIA_TAG
+DOCKER := $(shell which docker)
+PROJECTNAME=$(shell basename "$(PWD)")
+DOCKER_GOOS ?= linux
+DOCKER_GOARCH ?= amd64
+HTTPS_GIT := https://github.com/celestiaorg/celestia-app.git
+PACKAGE_NAME := github.com/celestiaorg/celestia-app/v11
+# Before upgrading the GOLANG_CROSS_VERSION, please verify that a Docker image exists with the new tag
+# and update GOLANG_CROSS_DIGEST to the digest of that tag's manifest index.
+# See https://github.com/goreleaser/goreleaser-cross/pkgs/container/goreleaser-cross
+GOLANG_CROSS_VERSION  ?= v1.26.5
+GOLANG_CROSS_DIGEST   ?= sha256:0cf2b7f757b40397d2bef5423adb88d0ac63899e88a9f0c4bbb370d3fb7b2fb5
+GOLANG_CROSS_IMAGE    := ghcr.io/goreleaser/goreleaser-cross:$(GOLANG_CROSS_VERSION)@$(GOLANG_CROSS_DIGEST)
+# Set this to override v2 upgrade height for the v3 embedded binaries
+V2_UPGRADE_HEIGHT ?= 0
+
+BUILD_TAGS_STANDALONE := ledger
+BUILD_TAGS_MULTIPLEXER := ledger,multiplexer
+
+LDFLAGS_COMMON := -X github.com/cosmos/cosmos-sdk/version.Name=celestia-app -X github.com/cosmos/cosmos-sdk/version.AppName=celestia-appd -X github.com/cosmos/cosmos-sdk/version.Version=$(VERSION) -X github.com/cosmos/cosmos-sdk/version.Commit=$(COMMIT) -X github.com/celestiaorg/celestia-app/v11/cmd/celestia-appd/cmd.v2UpgradeHeight=$(V2_UPGRADE_HEIGHT)
+LDFLAGS_STANDALONE := $(LDFLAGS_COMMON) -X github.com/cosmos/cosmos-sdk/version.BuildTags=$(BUILD_TAGS_STANDALONE)
+LDFLAGS_MULTIPLEXER := $(LDFLAGS_COMMON) -X github.com/cosmos/cosmos-sdk/version.BuildTags=$(BUILD_TAGS_MULTIPLEXER)
+
+BUILD_FLAGS_STANDALONE := -tags=$(BUILD_TAGS_STANDALONE) -ldflags '$(LDFLAGS_STANDALONE)'
+BUILD_FLAGS_MULTIPLEXER := -tags=$(BUILD_TAGS_MULTIPLEXER) -ldflags '$(LDFLAGS_MULTIPLEXER)'
+
+# The fibre server keeps its version metadata in package main, so that a binary
+# built from source reports a real version rather than "dev". These mirror the
+# values goreleaser injects for release builds, except that the commit is the
+# short hash here, the same way LDFLAGS_COMMON stamps celestia-appd. The date is
+# the commit date rather than the wall clock, so builds of the same commit are
+# reproducible, formatted in UTC to match goreleaser's .CommitDate exactly. Each
+# value falls back to the default already compiled into the binary when git
+# metadata is unavailable, e.g. building from an exported source tree with no
+# .git: an empty -X value blanks the field out rather than leaving the default in
+# place.
+COMMIT_DATE := $(shell TZ=UTC git log -1 --date=format-local:%Y-%m-%dT%H:%M:%SZ --format=%cd 2>/dev/null)
+LDFLAGS_FIBRE := -X main.version=$(or $(VERSION),dev) -X main.commit=$(or $(COMMIT),unknown) -X main.buildDate=$(or $(COMMIT_DATE),unknown)
+BUILD_FLAGS_FIBRE := -ldflags '$(LDFLAGS_FIBRE)'
+
+# NOTE: This version must be updated at the same time as the version in:
+# internal/embedding/data.go
+# .goreleaser.yaml
+# docker/multiplexer.Dockerfile
+# scripts/embedded_checksums.txt
+CELESTIA_V3_VERSION := v3.13.0
+CELESTIA_V4_VERSION := v4.1.0
+CELESTIA_V5_VERSION := v5.0.12
+CELESTIA_V6_VERSION := v6.4.10
+CELESTIA_V7_VERSION := v7.0.3-mocha
+CELESTIA_V8_VERSION := v8.0.8
+CELESTIA_V9_VERSION := v9.0.8
+CELESTIA_V10_VERSION := v10.5.0
+
+## help: Get more info on make commands.
+help: Makefile
+	@echo " Choose a command run in "$(PROJECTNAME)":"
+	@sed -n 's/^##//p' $< | sort | column -t -s ':' | sed -e 's/^/ /'
+.PHONY: help
+
+## build-standalone: Build the celestia-appd binary into the ./build directory.
+build-standalone: mod
+	@mkdir -p build/
+	@echo "--> Building build/celestia-appd"
+	@go build $(BUILD_FLAGS_STANDALONE) -o build/celestia-appd ./cmd/celestia-appd
+.PHONY: build-standalone
+
+DOWNLOAD ?= true
+## build: Build the celestia-appd binary into the ./build directory.
+build: mod
+ifeq ($(DOWNLOAD),true)
+	@$(MAKE) download-embedded-binaries
+endif
+	@mkdir -p build/
+	@echo "--> Building build/celestia-appd with multiplexer enabled"
+	@go build $(BUILD_FLAGS_MULTIPLEXER) -o build/celestia-appd ./cmd/celestia-appd
+.PHONY: build
+
+## install-standalone: Build and install the celestia-appd binary into the $GOPATH/bin directory. This target does not install the multiplexer.
+install-standalone:
+	@echo "--> Installing celestia-appd"
+	@go install $(BUILD_FLAGS_STANDALONE) ./cmd/celestia-appd
+.PHONY: install-standalone
+
+## install: Build and install the multiplexer version of celestia-appd into the $GOPATH/bin directory.
+# TODO: Improve logic here and in goreleaser to make it future proof and less expensive.
+install: download-embedded-binaries
+	@echo "--> Installing celestia-appd with multiplexer support"
+	@go install $(BUILD_FLAGS_MULTIPLEXER) ./cmd/celestia-appd
+.PHONY: install
+
+EMBEDDED_BINARY_TARGETS := $(foreach v,3 4 5 6 7 8 9 10,download-v$(v)-binaries)
+# v3 release tarballs are named celestia-app_*; later ones are celestia-app-standalone_*.
+EMBEDDED_TARBALL_PREFIX = $(if $(filter 3,$*),celestia-app,celestia-app-standalone)
+
+## download-embedded-binaries: Download the celestia-app v3-v10 binaries for the current platform.
+download-embedded-binaries: $(EMBEDDED_BINARY_TARGETS)
+.PHONY: download-embedded-binaries
+
+## download-vN-binaries: Download the celestia-app vN binary for the current platform.
+$(EMBEDDED_BINARY_TARGETS): download-v%-binaries:
+	@echo "--> Downloading celestia-app $(CELESTIA_V$*_VERSION) binary"
+	@mkdir -p internal/embedding
+	@os=$$(go env GOOS); arch=$$(go env GOARCH); \
+	case "$$os-$$arch" in \
+		darwin-arm64) url=$(EMBEDDED_TARBALL_PREFIX)_Darwin_arm64.tar.gz; out=celestia-app_darwin_v$*_arm64.tar.gz ;; \
+		linux-arm64) url=$(EMBEDDED_TARBALL_PREFIX)_Linux_arm64.tar.gz; out=celestia-app_linux_v$*_arm64.tar.gz ;; \
+		darwin-amd64) url=$(EMBEDDED_TARBALL_PREFIX)_Darwin_x86_64.tar.gz; out=celestia-app_darwin_v$*_amd64.tar.gz ;; \
+		linux-amd64) url=$(EMBEDDED_TARBALL_PREFIX)_Linux_x86_64.tar.gz; out=celestia-app_linux_v$*_amd64.tar.gz ;; \
+		*) echo "Unsupported platform: $$os-$$arch"; exit 1 ;; \
+	esac; \
+	bash scripts/download_binary.sh "$$url" "$$out" "$(CELESTIA_V$*_VERSION)"
+.PHONY: $(EMBEDDED_BINARY_TARGETS)
+
+## mod: Update all go.mod files.
+mod:
+	@echo "--> Updating go.mod"
+	@go mod tidy
+	@echo "--> Updating go.mod in ./test/docker-e2e"
+	@(cd ./test/docker-e2e && go mod tidy)
+.PHONY: mod
+
+## mod-verify: Verify dependencies have expected content.
+mod-verify: mod
+	@echo "--> Verifying dependencies have expected content"
+	GO111MODULE=on go mod verify
+.PHONY: mod-verify
+
+BUF_VERSION=v1.50.0
+GRPC_GATEWAY_PROTOC_GEN_OPENAPIV2_VERSION=2.20.0
+
+## proto-all: Format, lint and generate Protobuf files
+proto-all: proto-deps proto-format proto-lint proto-gen
+.PHONY: proto-all
+
+## proto-deps: Install Protobuf local dependencies
+#
+# protoc-gen-gocosmos and protoc-gen-grpc-gateway are the two plugins that
+# buf.gen.gogo.yaml invokes, so their versions determine the contents of the
+# generated .pb.go files. They are declared as `tool` directives in go.mod
+# (like golangci-lint), which means `go install` without a version suffix
+# builds the version recorded there. That keeps codegen reproducible and lets
+# dependabot bump the plugins along with the rest of the module graph.
+#
+# buf and protoc-gen-openapiv2 stay pinned here rather than as tool directives:
+# adding them to the module graph would drag in large, unrelated dependency
+# upgrades (buf alone adds ~120 go.sum lines and bumps docker/otel deps).
+proto-deps:
+	@echo "Installing proto deps"
+	@go install github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION)
+	@go install github.com/cosmos/gogoproto/protoc-gen-gocosmos
+	@go install github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway
+	@go install github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-openapiv2@v$(GRPC_GATEWAY_PROTOC_GEN_OPENAPIV2_VERSION)
+.PHONY: proto-deps
+
+## proto-gen: Generate Protobuf files.
+proto-gen:
+	@echo "Generating Protobuf files"
+	@sh ./scripts/protocgen.sh
+.PHONY: proto-gen
+
+## proto-format: Format Protobuf files.
+proto-format:
+	@find ./ -name "*.proto" -exec clang-format -i {} \;
+.PHONY: proto-format
+
+## proto-lint: Lint Protobuf files.
+proto-lint:
+	@buf lint --error-format=json
+.PHONY: proto-lint
+
+## proto-check-breaking: Check if Protobuf file contains breaking changes.
+proto-check-breaking:
+	@buf breaking --against $(HTTPS_GIT)#branch=main
+.PHONY: proto-check-breaking
+
+## proto-update-deps: Update Protobuf dependencies.
+proto-update-deps:
+	@echo "Updating Protobuf dependencies"
+	@cd proto && buf dep update
+.PHONY: proto-update-deps
+
+## proto-swagger-gen: Generate Swagger/OpenAPI spec from proto files.
+proto-swagger-gen:
+	@echo "Generating Swagger/OpenAPI specs..."
+	@bash scripts/proto-swagger-gen.sh
+.PHONY: proto-swagger-gen
+
+## docker-build: Build the celestia-appd docker image from the current branch. Requires docker.
+docker-build: build-docker-multiplexer
+.PHONY: docker-build
+
+## build-docker-multiplexer: Build the celestia-appd docker image with Multiplexer support from the current branch. Requires docker.
+build-docker-multiplexer:
+	@echo "--> Building Multiplexer Docker image"
+	$(DOCKER) build \
+		--build-arg TARGETOS=$(DOCKER_GOOS) \
+		--build-arg TARGETARCH=$(DOCKER_GOARCH) \
+		-t celestiaorg/celestia-app:$(COMMIT) \
+		-f docker/multiplexer.Dockerfile .
+.PHONY: build-docker-multiplexer
+
+## lint: Run all linters; golangci-lint, markdownlint, hadolint, yamllint.
+lint:
+	@echo "--> Running golangci-lint"
+	@go tool golangci-lint run
+	@echo "--> Running markdownlint"
+	@markdownlint --config .markdownlint.yaml '**/*.md'
+	@echo "--> Running hadolint"
+	@hadolint docker/multiplexer.Dockerfile docker/e2e.Dockerfile docker/standalone.Dockerfile docker/txsim/Dockerfile
+	@echo "--> Running yamllint"
+	@yamllint --no-warnings . -c .yamllint.yml
+.PHONY: lint
+
+## govulncheck: Check for vulnerabilities in dependencies.
+govulncheck:
+	@echo "--> Running govulncheck"
+	@go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+	@cd test/docker-e2e && go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+.PHONY: govulncheck
+
+## markdown-link-check: Check all links in markdown files for validity.
+markdown-link-check:
+	@echo "--> Running markdown-link-check"
+	@find . -name \*.md -print0 | xargs -0 -n1 markdown-link-check
+.PHONY: markdown-link-check
+
+## lint-links: Check all markdown links.
+lint-links: markdown-link-check
+.PHONY: lint-links
+
+## fmt: Format Go code with golangci-lint and markdown files with markdownlint.
+fmt:
+	@echo "--> Running golangci-lint --fix"
+	@go tool golangci-lint run --fix
+	@echo "--> Running markdownlint --fix"
+	@markdownlint --fix --quiet --config .markdownlint.yaml .
+.PHONY: fmt
+
+## lint-fix: Format files per linters golangci-lint and markdownlint.
+lint-fix: fmt
+.PHONY: lint-fix
+
+## test: Run tests.
+test:
+	@echo "--> Running tests"
+	@if [ -z "$(PACKAGES)" ]; then \
+		go test -timeout 30m ./...; \
+	else \
+		go test -timeout 30m $(PACKAGES); \
+	fi
+.PHONY: test
+
+## test-short: Run tests in short mode.
+test-short:
+	@echo "--> Running tests in short mode"
+	@go test ./... -short -timeout 1m
+.PHONY: test-short
+
+## test-docker-e2e: Run end to end tests via docker.
+test-docker-e2e:
+	@if [ -z "$(test)" ]; then \
+		echo "ERROR: 'test' variable is required. Usage: make test-docker-e2e test=TestE2ESimple [entrypoint=TestCelestiaTestSuite]"; \
+		exit 1; \
+	fi
+	@ENTRYPOINT=$${entrypoint:-TestCelestiaTestSuite}; \
+	echo "--> Running: $$ENTRYPOINT/$(test)"; \
+	cd test/docker-e2e && go test -count=1 -v -run ^$$ENTRYPOINT/$(test)$$ . -timeout 30m
+.PHONY: test-docker-e2e
+
+## test-docker-e2e-upgrade-all: Build image from current branch and run the upgrade test for all app versions starting from v2.
+test-docker-e2e-upgrade-all:
+	@echo "--> Building celestia-appd docker image (tag $(CELESTIA_TAG))"
+	@DOCKER_BUILDKIT=1 docker build --platform linux/amd64 -t "ghcr.io/celestiaorg/celestia-app:$(CELESTIA_TAG)" . -f docker/multiplexer.Dockerfile
+	@echo "--> Running upgrade test for all app versions starting from v2"
+	cd test/docker-e2e && go test -v -run ^TestCelestiaTestSuite/TestAllUpgrades$$ -count=1 ./... -timeout 15m
+.PHONY: test-docker-e2e-upgrade-all
+
+## test-multiplexer: Run unit tests for the multiplexer package.
+test-multiplexer: download-embedded-binaries
+	@echo "--> Running multiplexer tests"
+	@go test -tags multiplexer ./multiplexer/... ./cmd/celestia-appd/cmd
+.PHONY: test-multiplexer
+
+## test-race: Run tests in race mode.
+test-race:
+# TODO: Remove exclusions as race-mode failures and resource limits are resolved.
+# https://github.com/celestiaorg/celestia-app/issues/1369
+	@echo "--> Running tests in race mode"
+	@go test -count=1 -timeout 15m $(if $(PACKAGES),$(strip $(PACKAGES)),./...) -v -race -skip "TestPrepareProposalConsistency|TestIntegrationTestSuite|TestEvictions|TestPrepareProposalCappingNumberOfMessages"
+.PHONY: test-race
+
+## test-bench: Run benchmark unit tests.
+test-bench:
+	@echo "--> Running benchmark tests"
+	@go test -timeout 30m -tags=benchmarks -bench=. ./app/benchmarks/...
+.PHONY: test-bench
+
+## test-coverage: Generate test coverage.txt
+test-coverage:
+	@echo "--> Generating coverage.txt"
+	@export VERSION=$(VERSION); bash -x scripts/test_cover.sh
+.PHONY: test-coverage
+
+## test-fuzz: Run all fuzz tests, or one with FUZZ_TARGET=FuzzX.
+test-fuzz:
+	bash -x scripts/test_fuzz.sh
+.PHONY: test-fuzz
+
+## build-fibre-server: Build the fibre server binary into the ./build directory.
+build-fibre-server:
+	@mkdir -p build/
+	@echo "--> Building build/fibre"
+	@go build $(BUILD_FLAGS_FIBRE) -o build/fibre ./fibre/cmd
+.PHONY: build-fibre-server
+
+## install-fibre-server: Build and install the fibre server binary into the $GOPATH/bin directory.
+install-fibre-server:
+	@echo "--> Installing fibre server"
+	@go build $(BUILD_FLAGS_FIBRE) -o $(shell go env GOPATH)/bin/fibre ./fibre/cmd
+.PHONY: install-fibre-server
+
+## txsim-install: Install the tx simulator.
+txsim-install:
+	@echo "--> Installing tx simulator"
+	@go install $(BUILD_FLAGS_STANDALONE) ./test/cmd/txsim
+.PHONY: txsim-install
+
+## txsim-build: Build the tx simulator binary into the ./build directory.
+txsim-build:
+	@echo "--> Building tx simulator"
+	@mkdir -p build/
+	@go build $(BUILD_FLAGS_STANDALONE) -o build/ ./test/cmd/txsim
+	@go mod tidy
+.PHONY: txsim-build
+
+## txsim-build-docker: Build the tx simulator Docker image. Requires Docker.
+txsim-build-docker:
+	docker build -t ghcr.io/celestiaorg/txsim -f docker/txsim/Dockerfile  .
+.PHONY: txsim-build-docker
+
+## latency-monitor-build-docker: Build the latency monitor Docker image. Requires Docker.
+latency-monitor-build-docker:
+	docker build -t ghcr.io/celestiaorg/latency-monitor:$(CELESTIA_TAG) -f docker/latency-monitor/Dockerfile .
+.PHONY: latency-monitor-build-docker
+
+## build-talis-bins: Build binaries for talis VMs (ubuntu 22.04 LTS), including the fibre experiment tools.
+build-talis-bins:
+	mkdir -p build
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags="ledger" -ldflags="$(LDFLAGS_STANDALONE)" -o build/txsim ./test/cmd/txsim
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags="ledger" -ldflags="$(LDFLAGS_STANDALONE)" -o build/latency-monitor ./tools/latency-monitor
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags="ledger" -ldflags="$(LDFLAGS_STANDALONE)" -o build/celestia-appd ./cmd/celestia-appd
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags="ledger" -ldflags="$(LDFLAGS_FIBRE)" -o build/fibre ./fibre/cmd
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags="ledger" -ldflags="$(LDFLAGS_STANDALONE)" -o build/fibre-txsim ./tools/fibre-txsim
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags="ledger" -ldflags="$(LDFLAGS_STANDALONE)" -o build/fibre-reader ./tools/fibre-reader
+.PHONY: build-talis-bins
+
+CARGO := $(HOME)/.cargo/bin/cargo
+
+# Ensure cargo is on PATH and install rustup if missing.
+.PHONY: ensure-rust
+ensure-rust:
+	@if ! command -v $(CARGO) >/dev/null 2>&1; then \
+		echo "Rust is not installed. Installing..."; \
+		curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y; \
+		echo ""; \
+		echo "Rust installed. Continuing with cargo from $$HOME/.cargo/bin..."; \
+	fi
+
+# build_rust_crate runs `cargo xtask build-linux` in the given crate and copies
+# the resulting binary to build/.
+# Usage: $(call build_rust_crate,<crate_dir>,<bin_name>,<dest_name>)
+define build_rust_crate
+	cd $(1) && $(CARGO) xtask build-linux
+	@mkdir -p build
+	@if [ -f $(1)/target/x86_64-unknown-linux-gnu/release/$(2) ]; then \
+		cp $(1)/target/x86_64-unknown-linux-gnu/release/$(2) build/$(3); \
+	else \
+		cp $(1)/target/release/$(2) build/$(3); \
+	fi
+endef
+
+## build-rust-fibre-txsim: Build rust-fibre-txsim for Linux x86_64 (installs Rust and cross-compiler if needed)
+build-rust-fibre-txsim: export PATH := $(HOME)/.cargo/bin:$(PATH)
+build-rust-fibre-txsim: ensure-rust
+	$(call build_rust_crate,tools/rust-fibre-txsim,rust-fibre-txsim,fibre-txsim)
+.PHONY: build-rust-fibre-txsim
+
+## build-talis-bins-rust-fibre: Build talis binaries using Rust fibre-txsim instead of Go fibre-txsim
+build-talis-bins-rust-fibre:
+	mkdir -p build
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags="ledger" -ldflags="$(LDFLAGS_STANDALONE)" -o build/txsim ./test/cmd/txsim
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags="ledger" -ldflags="$(LDFLAGS_STANDALONE)" -o build/latency-monitor ./tools/latency-monitor
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags="ledger" -ldflags="$(LDFLAGS_STANDALONE)" -o build/celestia-appd ./cmd/celestia-appd
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags="ledger" -ldflags="$(LDFLAGS_STANDALONE)" -o build/fibre ./fibre/cmd
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags="ledger" -ldflags="$(LDFLAGS_STANDALONE)" -o build/fibre-reader ./tools/fibre-reader
+	$(MAKE) build-rust-fibre-txsim
+.PHONY: build-talis-bins-rust-fibre
+
+## build-lumina-latency-monitor: Build lumina-latency-monitor for Linux x86_64 (installs Rust and cross-compiler if needed)
+build-lumina-latency-monitor: export PATH := $(HOME)/.cargo/bin:$(PATH)
+build-lumina-latency-monitor: ensure-rust
+	$(call build_rust_crate,tools/lumina-latency-monitor,lumina-latency-monitor,latency-monitor)
+.PHONY: build-lumina-latency-monitor
+
+## adr-gen: Download the ADR template from the celestiaorg/.github repo.
+adr-gen:
+	@echo "--> Downloading ADR template"
+	@curl -sSL https://raw.githubusercontent.com/celestiaorg/.github/main/adr-template.md > docs/architecture/adr-template.md
+.PHONY: adr-gen
+
+## check-goreleaser-image: Verify the pinned goreleaser-cross Docker image exists so releases don't silently ship without binaries.
+check-goreleaser-image:
+	@./scripts/check-goreleaser-image.sh ${GOLANG_CROSS_VERSION} ${GOLANG_CROSS_DIGEST}
+.PHONY: check-goreleaser-image
+
+## goreleaser-check: Check the .goreleaser.yaml config file.
+goreleaser-check:
+	@if [ ! -f ".release-env" ]; then \
+		echo "A .release-env file was not found but is required to create prebuilt binaries. This command is expected to be run in CI where a .release-env file exists. If you need to run this command locally to attach binaries to a release, you need to create a .release-env file with a Github token (classic) that has repo:public_repo scope."; \
+		exit 1;\
+	fi
+	docker run \
+		--rm \
+		--env CGO_ENABLED=1 \
+		--env GORELEASER_CURRENT_TAG=${GORELEASER_CURRENT_TAG} \
+		--env-file .release-env \
+		-v `pwd`:/go/src/$(PACKAGE_NAME) \
+		-w /go/src/$(PACKAGE_NAME) \
+		$(GOLANG_CROSS_IMAGE) \
+		check
+.PHONY: goreleaser-check
+
+## prebuilt-binary: Create prebuilt binaries for all supported platforms using goreleaser. Used by the goreleaser target.
+prebuilt-binary:
+	@if [ ! -f ".release-env" ]; then \
+		echo "A .release-env file was not found but is required to create prebuilt binaries. This command is expected to be run in CI where a .release-env file exists. If you need to run this command locally to attach binaries to a release, you need to create a .release-env file with a Github token (classic) that has repo:public_repo scope."; \
+		exit 1;\
+	fi
+	docker run \
+		--rm \
+		--env CGO_ENABLED=1 \
+		--env GORELEASER_CURRENT_TAG=${GORELEASER_CURRENT_TAG} \
+		--env-file .release-env \
+		-v `pwd`:/go/src/$(PACKAGE_NAME) \
+		-w /go/src/$(PACKAGE_NAME) \
+		$(GOLANG_CROSS_IMAGE) \
+		release --clean --parallelism 1
+.PHONY: prebuilt-binary
+
+## goreleaser-dry-run: ensures that the go releaser tool can build all the artifacts correctly.
+goreleaser-dry-run:
+# Specifies parallelism as 4 so should be run locally. On the regular github runners 2 should be the max.
+	@echo "Running GoReleaser in dry-run mode..."
+	docker run \
+		--rm \
+		--env CGO_ENABLED=1 \
+		--env GORELEASER_CURRENT_TAG=${GORELEASER_CURRENT_TAG} \
+		--env-file .release-env \
+		-v `pwd`:/go/src/$(PACKAGE_NAME) \
+		-w /go/src/$(PACKAGE_NAME) \
+		$(GOLANG_CROSS_IMAGE) \
+		release --snapshot --clean --parallelism 1
+.PHONY: goreleaser-dry-run
+
+## goreleaser: Create prebuilt binaries and attach them to GitHub release. Requires Docker.
+goreleaser: prebuilt-binary
+.PHONY: goreleaser
+
+## check-bbr: Internal command to check if BBR congestion control is enabled on the system.
+check-bbr:
+	@echo "Checking if BBR is enabled..."
+	@if [ "$$(uname -s)" != "Linux" ]; then \
+		echo "BBR is not available on non-Linux systems."; \
+		exit 0; \
+	elif [ "$$(sysctl net.ipv4.tcp_congestion_control | awk '{print $$3}')" != "bbr" ]; then \
+		echo "WARNING: BBR is not enabled. Please enable BBR for optimal performance. Call make enable-bbr or see Usage section in the README."; \
+	else \
+		echo "BBR is enabled."; \
+	fi
+.PHONY: check-bbr
+
+## bbr-check: Check if your system uses BBR congestion control algorithm. Only works on Linux.
+bbr-check: check-bbr
+.PHONY: bbr-check
+
+## enable-bbr: Enable BBR congestion control algorithm on your system. This improves network performance. Only works on Linux.
+enable-bbr:
+	@echo "Configuring system to use BBR..."
+	@if [ "$$(uname -s)" != "Linux" ]; then \
+		echo "BBR is not available on non-Linux systems."; \
+		exit 0; \
+	elif [ "$$(sysctl net.ipv4.tcp_congestion_control | awk '{print $$3}')" != "bbr" ]; then \
+	    echo "BBR is not enabled. Configuring BBR..."; \
+	    sudo modprobe tcp_bbr && \
+            echo tcp_bbr | sudo tee -a /etc/modules && \
+	    echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.conf && \
+	    echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a /etc/sysctl.conf && \
+	    sudo sysctl -p && \
+	    echo "BBR has been enabled." || \
+	    echo "Failed to enable BBR. Please check error messages above."; \
+	else \
+	    echo "BBR is already enabled."; \
+	fi
+.PHONY: enable-bbr
+
+## bbr-enable: Enable BBR congestion control algorithm. Only works on Linux.
+bbr-enable: enable-bbr
+.PHONY: bbr-enable
+
+## disable-bbr: Disable BBR congestion control algorithm and revert to default (Cubic). Only works on Linux.
+disable-bbr:
+	@echo "Disabling BBR and reverting to default congestion control algorithm..."
+	@if [ "$$(sysctl net.ipv4.tcp_congestion_control | awk '{print $$3}')" = "bbr" ]; then \
+	    echo "BBR is currently enabled. Reverting to Cubic..."; \
+	    sudo sed -i '/^net.core.default_qdisc=fq/d' /etc/sysctl.conf && \
+	    sudo sed -i '/^net.ipv4.tcp_congestion_control=bbr/d' /etc/sysctl.conf && \
+	    sudo modprobe -r tcp_bbr && \
+	    echo "net.ipv4.tcp_congestion_control=cubic" | sudo tee -a /etc/sysctl.conf && \
+	    sudo sysctl -p && \
+	    echo "BBR has been disabled, and Cubic is now the default congestion control algorithm." || \
+	    echo "Failed to disable BBR. Please check error messages above."; \
+	else \
+	    echo "BBR is not enabled. No changes made."; \
+	fi
+.PHONY: disable-bbr
+
+## bbr-disable: Disable BBR congestion control algorithm and revert to default.
+bbr-disable: disable-bbr
+.PHONY: bbr-disable

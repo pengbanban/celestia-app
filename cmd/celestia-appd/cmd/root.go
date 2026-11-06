@@ -1,0 +1,224 @@
+package cmd
+
+import (
+	"fmt"
+	"os"
+
+	"cosmossdk.io/log"
+	confixcmd "cosmossdk.io/tools/confix/cmd"
+	"github.com/celestiaorg/celestia-app/v11/app"
+	tmcli "github.com/cometbft/cometbft/libs/cli"
+	dbm "github.com/cosmos/cosmos-db"
+	"github.com/cosmos/cosmos-sdk/client"
+	clientconfig "github.com/cosmos/cosmos-sdk/client/config"
+	"github.com/cosmos/cosmos-sdk/client/debug"
+	"github.com/cosmos/cosmos-sdk/client/flags"
+	"github.com/cosmos/cosmos-sdk/client/keys"
+	"github.com/cosmos/cosmos-sdk/client/snapshot"
+	"github.com/cosmos/cosmos-sdk/server"
+	serverconfig "github.com/cosmos/cosmos-sdk/server/config"
+	simtestutil "github.com/cosmos/cosmos-sdk/testutil/sims"
+	"github.com/cosmos/cosmos-sdk/x/auth/types"
+	genutilcli "github.com/cosmos/cosmos-sdk/x/genutil/client/cli"
+	kitlog "github.com/go-kit/log"
+	"github.com/spf13/cobra"
+)
+
+const (
+	// FlagLogToFile specifies whether to log to file or not.
+	FlagLogToFile = "log-to-file"
+
+	// UpgradeHeightFlag is the flag to specify the upgrade height for v1 to v2
+	// application upgrade.
+	UpgradeHeightFlag = "v2-upgrade-height"
+
+	// TimeoutCommitFlag is a flag that can be used to override the timeout_commit.
+	TimeoutCommitFlag = "timeout-commit"
+
+	// DelayedPrecommitTimeoutFlag is a flag that can be used to override the DelayedPrecommitTimeout.
+	DelayedPrecommitTimeoutFlag = "delayed-precommit-timeout"
+
+	// FlagFibrePromiseCache toggles the validator-local fibre promise cache used
+	// by the ValidatePaymentPromise query.
+	FlagFibrePromiseCache = "fibre-promise-cache"
+
+	// FlagPrivValGRPCAllowInsecure force-allows the privval gRPC endpoint to
+	// listen on a non-localhost address without mutual TLS.
+	FlagPrivValGRPCAllowInsecure = "privval-grpc-allow-insecure"
+)
+
+// NewRootCmd creates a new root command for celestia-appd.
+func NewRootCmd() *cobra.Command {
+	// we "pre"-instantiate the application for getting the injected/configured encoding configuration
+	// note, this is not necessary when using app wiring, as depinject can be directly used.
+	opts := simtestutil.NewAppOptionsWithFlagHome(app.NodeHome)
+	tempApp := app.New(log.NewNopLogger(), dbm.NewMemDB(), nil, 0, 0, opts)
+	encodingConfig := tempApp.GetEncodingConfig()
+
+	initClientContext := client.Context{}.
+		WithCodec(encodingConfig.Codec).
+		WithInterfaceRegistry(encodingConfig.InterfaceRegistry).
+		WithTxConfig(tempApp.GetTxConfig()).
+		WithLegacyAmino(encodingConfig.Amino).
+		WithInput(os.Stdin).
+		WithAccountRetriever(types.AccountRetriever{}).
+		WithBroadcastMode(flags.BroadcastSync).
+		WithHomeDir(app.NodeHome).
+		WithViper(app.EnvPrefix)
+
+	rootCommand := &cobra.Command{
+		Use: "celestia-appd",
+		PersistentPreRunE: func(command *cobra.Command, _ []string) error {
+			command.SetOut(command.OutOrStdout())
+			command.SetErr(command.ErrOrStderr())
+
+			clientContext, err := client.ReadPersistentCommandFlags(initClientContext, command.Flags())
+			if err != nil {
+				return err
+			}
+			clientContext, err = clientconfig.ReadFromClientConfig(clientContext)
+			if err != nil {
+				return err
+			}
+			if err := client.SetCmdClientContextHandler(clientContext, command); err != nil {
+				return err
+			}
+
+			appTemplate := serverconfig.DefaultConfigTemplate
+			appConfig := app.DefaultAppConfig()
+			tmConfig := app.DefaultConsensusConfig()
+
+			// Override the default tendermint config and app config for celestia-app
+			err = server.InterceptConfigsPreRunHandler(command, appTemplate, appConfig, tmConfig)
+			if err != nil {
+				return err
+			}
+
+			return replaceLogger(command)
+		},
+		SilenceUsage: true,
+	}
+
+	rootCommand.PersistentFlags().String(FlagLogToFile, "", "Write logs directly to a file. If empty, logs are written to stderr")
+	initRootCommand(rootCommand, tempApp)
+
+	autoCliOpts := tempApp.AutoCliOpts()
+	autoCliOpts.ClientCtx = initClientContext
+	if err := autoCliOpts.EnhanceRootCommand(rootCommand); err != nil {
+		panic(fmt.Errorf("failed to enhance root command: %w", err))
+	}
+
+	return rootCommand
+}
+
+// initRootCommand performs a bunch of side-effects on the root command.
+func initRootCommand(rootCommand *cobra.Command, capp *app.App) {
+	debugCmd := debug.Cmd()
+	debugCmd.AddCommand(
+		NewInPlaceTestnetCmd(),
+		AppGenesisToCometGenesisConverterCmd(),
+		server.ModuleHashByHeightQuery(NewAppServer),
+		listTypesCmd(),
+		CheckVersionCmd(),
+	)
+
+	configCmd := confixcmd.ConfigCommand()
+	configCmd.AddCommand(syncConfigCmd())
+	rootCommand.AddCommand(
+		InitCmd(capp),
+		genutilcli.Commands(capp.GetTxConfig(), capp.BasicManager, app.NodeHome),
+		tmcli.NewCompletionCmd(rootCommand, true),
+		debugCmd,
+		configCmd,
+		addrbookCommand(),
+		compactBlockstoreCommand(),
+		downloadGenesisCommand(),
+		addrConversionCmd(),
+		server.StatusCommand(),
+		queryCommand(capp.BasicManager),
+		txCommand(capp.BasicManager),
+		keys.Commands(),
+		snapshot.Cmd(NewAppServer),
+		updateConfigCmd(),
+		recoveryScriptCmd(),
+	)
+
+	modifyRootCommand(rootCommand)
+	if err := addRollbackAppVersionCheck(rootCommand); err != nil {
+		panic(fmt.Errorf("failed to add rollback check: %w", err))
+	}
+
+	// Add hooks run prior to the start command
+	if err := addPreStartHooks(rootCommand, allowInsecurePrivValGRPC, validateAPIConfig, overrideConsensusTimeouts, overrideP2PConfig, checkBBR, overrideMinRetainBlocks, setupOTelMetrics); err != nil {
+		panic(fmt.Errorf("failed to add pre-start hooks: %w", err))
+	}
+}
+
+// addStartFlags adds flags to the start command.
+func addStartFlags(startCmd *cobra.Command) {
+	startCmd.Flags().Int64(UpgradeHeightFlag, 0, "Upgrade height to switch from v1 to v2. Must be coordinated amongst all validators")
+	if err := startCmd.Flags().MarkDeprecated(UpgradeHeightFlag, "This flag is deprecated and was only useful prior to v4."); err != nil {
+		panic(err)
+	}
+
+	startCmd.Flags().Duration(TimeoutCommitFlag, 0, "Override the application configured timeout_commit. Note: only for testing purposes.")
+	startCmd.Flags().Duration(DelayedPrecommitTimeoutFlag, 0, "Override the DelayedPrecommitTimeout to control block time. Note: only for testing purposes.")
+	startCmd.Flags().Bool(FlagForceNoBBR, false, "bypass the requirement to use bbr locally")
+	startCmd.Flags().Bool(bypassOverridesFlagKey, false, "bypass config overrides for consensus timeouts, P2P rates, and mempool settings. The CAT mempool type and min-retain-blocks are always enforced. WARNING: Only use if strictly required. Using this flag may prevent your node from staying at the tip of the chain.")
+	startCmd.Flags().Bool(FlagFibrePromiseCache, true, "enable the validator-local fibre promise cache used by the ValidatePaymentPromise query. Enabled by default.")
+	startCmd.Flags().Bool(FlagPrivValGRPCAllowInsecure, false, "DANGER: allow the privval gRPC endpoint to listen on a non-localhost address without mutual TLS; anyone who can reach it can request signatures from the validator key")
+	addOTelMetricsFlag(startCmd)
+
+	prevPostRunE := startCmd.PostRunE
+	startCmd.PostRunE = func(cmd *cobra.Command, args []string) error {
+		shutdownOTelMetrics(cmd)
+		if prevPostRunE != nil {
+			return prevPostRunE(cmd, args)
+		}
+		return nil
+	}
+}
+
+// allowInsecurePrivValGRPC sets priv_validator_grpc_allow_insecure to true in
+// the comet config when the --privval-grpc-allow-insecure flag is passed.
+func allowInsecurePrivValGRPC(cmd *cobra.Command, logger log.Logger) error {
+	allow, err := cmd.Flags().GetBool(FlagPrivValGRPCAllowInsecure)
+	if err != nil || !allow {
+		return err
+	}
+
+	logger.Warn("DANGER: forcing priv_validator_grpc_allow_insecure=true; the privval gRPC endpoint may listen on a non-localhost address without mutual TLS")
+
+	sctx := server.GetServerContextFromCmd(cmd)
+	sctx.Config.PrivValidatorGRPCAllowInsecure = true
+	return nil
+}
+
+// replaceLogger optionally replaces the logger with a file logger if the flag
+// is set to something other than the default.
+func replaceLogger(cmd *cobra.Command) error {
+	logFilePath, err := cmd.Flags().GetString(FlagLogToFile)
+	if err != nil {
+		return err
+	}
+
+	if logFilePath == "" {
+		return nil
+	}
+
+	file, err := os.OpenFile(logFilePath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+
+	sctx := server.GetServerContextFromCmd(cmd)
+	// Disable colored output when logging to a file so that the log file does
+	// not contain ANSI color escape codes (e.g. [90m). See
+	// https://github.com/celestiaorg/celestia-app/issues/4966
+	sctx.Viper.Set(flags.FlagLogNoColor, true)
+	sctx.Logger, err = server.CreateSDKLogger(sctx, kitlog.NewSyncWriter(file))
+	if err != nil {
+		return fmt.Errorf("failed to create logger: %w", err)
+	}
+	return server.SetCmdServerContext(cmd, sctx)
+}

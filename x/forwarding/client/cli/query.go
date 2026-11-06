@@ -1,0 +1,163 @@
+package cli
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/celestiaorg/celestia-app/v11/x/forwarding/types"
+	"github.com/cosmos/cosmos-sdk/client"
+	"github.com/cosmos/cosmos-sdk/client/flags"
+	"github.com/spf13/cobra"
+)
+
+const (
+	FlagCustomHookID       = "custom-hook-id"
+	FlagCustomHookMetadata = "custom-hook-metadata"
+)
+
+// GetQueryCmd returns the query commands for the forwarding module.
+func GetQueryCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:                        types.ModuleName,
+		Short:                      "Forwarding module query subcommands",
+		DisableFlagParsing:         true,
+		SuggestionsMinimumDistance: 2,
+		RunE:                       client.ValidateCmd,
+	}
+
+	cmd.AddCommand(
+		CmdDeriveAddress(),
+		CmdQuoteFee(),
+	)
+
+	return cmd
+}
+
+// CmdDeriveAddress returns a CLI command for querying a derived forwarding address.
+func CmdDeriveAddress() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "derive-address [token-id] [dest-domain] [dest-recipient]",
+		Short: "Derive the forwarding address for given destination parameters",
+		Long: `Derive the deterministic forwarding address for a given destination domain and recipient.
+
+Pass --custom-hook-id to bind the address to a specific post-dispatch hook (e.g. your own
+IGP). The resulting address can then only be forwarded through that hook, and the same
+--custom-hook-id must be given to "tx forwarding forward".
+
+Example:
+  celestia-appd query forwarding derive-address 0x1234... 42161 0x000000000000000000000000742d35cc6634c0532925a3b844bc9e7595f00000
+
+  celestia-appd query forwarding derive-address 0x1234... 42161 0x0000...0000 \
+    --custom-hook-id 0x<hook-id>`,
+		Args: cobra.ExactArgs(3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			clientCtx, err := client.GetClientQueryContext(cmd)
+			if err != nil {
+				return err
+			}
+
+			tokenID := args[0]
+			destDomainStr := args[1]
+			destRecipient := args[2]
+
+			// Sanitize: ensure 0x prefix for consistency
+			if !strings.HasPrefix(strings.ToLower(destRecipient), "0x") {
+				destRecipient = "0x" + destRecipient
+			}
+
+			destDomain, err := strconv.ParseUint(destDomainStr, 10, 32)
+			if err != nil {
+				return fmt.Errorf("invalid dest_domain: %w", err)
+			}
+
+			customHookID, err := cmd.Flags().GetString(FlagCustomHookID)
+			if err != nil {
+				return err
+			}
+			customHookMetadata, err := cmd.Flags().GetString(FlagCustomHookMetadata)
+			if err != nil {
+				return err
+			}
+
+			queryClient := types.NewQueryClient(clientCtx)
+			res, err := queryClient.DeriveForwardingAddress(cmd.Context(), &types.QueryDeriveForwardingAddressRequest{
+				DestDomain:         uint32(destDomain),
+				DestRecipient:      destRecipient,
+				TokenId:            tokenID,
+				CustomHookId:       customHookID,
+				CustomHookMetadata: customHookMetadata,
+			})
+			if err != nil {
+				return err
+			}
+
+			return clientCtx.PrintProto(res)
+		},
+	}
+
+	cmd.Flags().String(FlagCustomHookID, "", "Optional post-dispatch hook id to bind the address to; the address can then only be forwarded through that hook. Empty = mailbox default hook")
+	cmd.Flags().String(FlagCustomHookMetadata, "", "Optional hex-encoded hook metadata to bind the address to; committed alongside --custom-hook-id and must match at forward time")
+	flags.AddQueryFlagsToCmd(cmd)
+
+	return cmd
+}
+
+// CmdQuoteFee returns a CLI command for querying the IGP fee for forwarding.
+func CmdQuoteFee() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "quote-fee [token-id] [dest-domain]",
+		Short: "Query the estimated IGP fee for forwarding a token to a destination domain",
+		Long: `Query the estimated Hyperlane IGP fee required for forwarding a token to a destination domain.
+Relayers should use this to determine the max_igp_fee to provide in MsgForward.
+
+Example:
+  celestia-appd query forwarding quote-fee 0x1234... 42161`,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			clientCtx, err := client.GetClientQueryContext(cmd)
+			if err != nil {
+				return err
+			}
+
+			tokenID := args[0]
+			destDomainStr := args[1]
+			destDomain, err := strconv.ParseUint(destDomainStr, 10, 32)
+			if err != nil {
+				return fmt.Errorf("invalid dest_domain: %w", err)
+			}
+
+			// Optional custom post-dispatch hook (and metadata) so the quote matches
+			// the fee MsgForward will charge when the same --custom-hook-id and
+			// --custom-hook-metadata are used. Empty quotes against the mailbox
+			// default hook.
+			customHookID, err := cmd.Flags().GetString(FlagCustomHookID)
+			if err != nil {
+				return err
+			}
+			customHookMetadata, err := cmd.Flags().GetString(FlagCustomHookMetadata)
+			if err != nil {
+				return err
+			}
+
+			queryClient := types.NewQueryClient(clientCtx)
+			res, err := queryClient.QuoteForwardingFee(cmd.Context(), &types.QueryQuoteForwardingFeeRequest{
+				DestDomain:         uint32(destDomain),
+				TokenId:            tokenID,
+				CustomHookId:       customHookID,
+				CustomHookMetadata: customHookMetadata,
+			})
+			if err != nil {
+				return err
+			}
+
+			return clientCtx.PrintProto(res)
+		},
+	}
+
+	cmd.Flags().String(FlagCustomHookID, "", "Optional post-dispatch hook id to quote against (must match the --custom-hook-id used in tx forward); empty = mailbox default hook")
+	cmd.Flags().String(FlagCustomHookMetadata, "", "Optional hex-encoded metadata to quote against (must match the --custom-hook-metadata used in tx forward); relevant only for hooks that price off metadata")
+	flags.AddQueryFlagsToCmd(cmd)
+
+	return cmd
+}

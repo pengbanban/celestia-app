@@ -1,0 +1,425 @@
+package keeper
+
+import (
+	"context"
+
+	errorsmod "cosmossdk.io/errors"
+	"cosmossdk.io/math"
+	"github.com/celestiaorg/celestia-app/v11/fibre"
+	"github.com/celestiaorg/celestia-app/v11/fibre/validator"
+	"github.com/celestiaorg/celestia-app/v11/x/fibre/types"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
+	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
+	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
+)
+
+var _ types.MsgServer = msgServer{}
+
+type msgServer struct {
+	Keeper
+}
+
+// NewMsgServerImpl returns an implementation of the fibre MsgServer interface
+// for the provided Keeper.
+func NewMsgServerImpl(keeper Keeper) types.MsgServer {
+	return &msgServer{Keeper: keeper}
+}
+
+// DepositToEscrow deposits funds to the signer's escrow account
+func (ms msgServer) DepositToEscrow(goCtx context.Context, msg *types.MsgDepositToEscrow) (*types.MsgDepositToEscrowResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	// Convert signer address
+	signerAddr, err := sdk.AccAddressFromBech32(msg.Signer)
+	if err != nil {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrInvalidAddress, "invalid signer address: %s", err)
+	}
+	// Key the escrow account by the canonical address string. msg.Signer may be
+	// the uppercase form of the same bech32 address, and settlement looks the
+	// account up by sdk.AccAddress(pubKey.Address()).String().
+	signer := signerAddr.String()
+
+	// Get or create escrow account
+	escrowAccount, found := ms.GetEscrowAccount(ctx, signer)
+	if !found {
+		escrowAccount = types.EscrowAccount{
+			Signer:           signer,
+			Balance:          sdk.NewCoin(msg.Amount.Denom, math.ZeroInt()),
+			AvailableBalance: sdk.NewCoin(msg.Amount.Denom, math.ZeroInt()),
+		}
+	}
+
+	// Transfer funds from user to module
+	if err := ms.bankKeeper.SendCoinsFromAccountToModule(ctx, signerAddr, types.ModuleName, sdk.NewCoins(msg.Amount)); err != nil {
+		return nil, errorsmod.Wrapf(err, "failed to transfer funds to escrow")
+	}
+
+	// Update escrow account balances
+	escrowAccount.Balance = escrowAccount.Balance.Add(msg.Amount)
+	escrowAccount.AvailableBalance = escrowAccount.AvailableBalance.Add(msg.Amount)
+
+	// Save the updated escrow account
+	ms.SetEscrowAccount(ctx, escrowAccount)
+
+	// Emit event
+	event := types.NewEventDepositToEscrow(signer, msg.Amount)
+	if err := ctx.EventManager().EmitTypedEvent(event); err != nil {
+		return nil, err
+	}
+
+	return &types.MsgDepositToEscrowResponse{}, nil
+}
+
+// RequestWithdrawal requests withdrawal from the signer's escrow account
+func (ms msgServer) RequestWithdrawal(goCtx context.Context, msg *types.MsgRequestWithdrawal) (*types.MsgRequestWithdrawalResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	// Use the canonical address string, see DepositToEscrow.
+	signerAddr, err := sdk.AccAddressFromBech32(msg.Signer)
+	if err != nil {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrInvalidAddress, "invalid signer address: %s", err)
+	}
+	signer := signerAddr.String()
+
+	// Get escrow account
+	escrowAccount, found := ms.GetEscrowAccount(ctx, signer)
+	if !found {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrNotFound, "escrow account not found for signer: %s", signer)
+	}
+
+	// Check if sufficient available balance
+	if escrowAccount.AvailableBalance.IsLT(msg.Amount) {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrInsufficientFunds, "insufficient available balance: have %s, need %s", escrowAccount.AvailableBalance, msg.Amount)
+	}
+
+	// Get withdrawal delay from params
+	params := ms.GetParams(ctx)
+	requestedTimestamp := ctx.BlockTime()
+
+	// Verify no existing withdrawal request at current timestamp (prevents key collision)
+	_, existing := ms.GetWithdrawal(ctx, signer, requestedTimestamp)
+	if existing {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "withdrawal request already exists for signer %s at timestamp %v", signer, requestedTimestamp)
+	}
+
+	availableTimestamp := requestedTimestamp.Add(params.WithdrawalDelay)
+
+	// Create withdrawal request with available timestamp
+	withdrawal := types.Withdrawal{
+		Signer:             signer,
+		Amount:             msg.Amount,
+		RequestedTimestamp: requestedTimestamp,
+		AvailableTimestamp: availableTimestamp,
+	}
+
+	// Update escrow account available balance (lock the funds)
+	escrowAccount.AvailableBalance = escrowAccount.AvailableBalance.Sub(msg.Amount)
+	ms.SetEscrowAccount(ctx, escrowAccount)
+
+	// Save withdrawal request to both indexes
+	ms.SetWithdrawal(ctx, withdrawal)
+
+	// Emit event
+	event := types.NewEventWithdrawFromEscrowRequest(signer, msg.Amount, requestedTimestamp, availableTimestamp)
+	if err := ctx.EventManager().EmitTypedEvent(event); err != nil {
+		return nil, err
+	}
+
+	return &types.MsgRequestWithdrawalResponse{}, nil
+}
+
+// PayForFibre processes a payment promise with validator signatures
+func (ms msgServer) PayForFibre(goCtx context.Context, msg *types.MsgPayForFibre) (*types.MsgPayForFibreResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	// Convert payment promise to internal format
+	pp := fibre.PaymentPromise{}
+	if err := pp.FromProto(&msg.PaymentPromise); err != nil {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "failed to convert payment promise: %s", err)
+	}
+
+	// Perform stateless validation (signature verification, format checks, etc.)
+	if err := ms.ValidatePromiseStateless(&pp); err != nil {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "payment promise validation failed: %s", err)
+	}
+
+	// Perform stateful verification (escrow account, balance, not already processed)
+	_, err := ms.ValidatePaymentPromiseStateful(ctx, &msg.PaymentPromise)
+	if err != nil {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "payment promise stateful verification failed: %s", err)
+	}
+
+	promiseHash, err := pp.Hash()
+	if err != nil {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "failed to hash payment promise: %s", err)
+	}
+
+	// Get escrow account for the payment promise signer
+	signerPubKey := msg.PaymentPromise.SignerPublicKey
+	signerAddr := sdk.AccAddress(signerPubKey.Address()).String()
+
+	escrowAccount, found := ms.GetEscrowAccount(ctx, signerAddr)
+	if !found {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrNotFound, "escrow account not found for signer: %s", signerAddr)
+	}
+
+	// Calculate payment amount based on blob size and gas per byte
+	paymentAmount := ms.calculatePaymentAmount(ctx, msg.PaymentPromise.BlobSize)
+
+	// Deduct payment from escrow account (may reduce pending withdrawals if needed)
+	if err := ms.deductPaymentFromEscrow(ctx, &escrowAccount, paymentAmount); err != nil {
+		return nil, err
+	}
+
+	// Record processed payment
+	processedPayment := types.ProcessedPayment{
+		PaymentPromiseHash: promiseHash,
+		ProcessedAt:        ctx.BlockTime(),
+	}
+	ms.SetProcessedPayment(ctx, processedPayment)
+
+	// ProcessProposal returns only ACCEPT or REJECT, and its per-transaction
+	// event manager is discarded. FinalizeBlock still emits the payment event.
+	if ctx.ExecMode() != sdk.ExecModeProcessProposal {
+		// PayForFibreEvent rather than EmitTypedEvent: the same event without the
+		// per-payment protobuf JSON marshal and map decode.
+		ctx.EventManager().EmitEvent(types.PayForFibreEvent(
+			signerAddr,
+			msg.PaymentPromise.Namespace,
+			msg.PaymentPromise.Commitment,
+			uint32(len(msg.ValidatorSignatures)),
+		))
+	}
+
+	return &types.MsgPayForFibreResponse{}, nil
+}
+
+// ValidatePayForFibreSignatures verifies the payment promise and validator signatures.
+func (k Keeper) ValidatePayForFibreSignatures(ctx sdk.Context, msg *types.MsgPayForFibre) error {
+	pp := fibre.PaymentPromise{}
+	if err := pp.FromProto(&msg.PaymentPromise); err != nil {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "failed to convert payment promise: %s", err)
+	}
+	if err := k.ValidatePromiseStateless(&pp); err != nil {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "payment promise validation failed: %s", err)
+	}
+	signBytes, err := pp.SignBytes()
+	if err != nil {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "failed to get validator sign bytes: %s", err)
+	}
+	if err := k.validateValidatorSignatures(ctx, signBytes, msg.PaymentPromise.Height, msg.ValidatorSignatures); err != nil {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "validator signature validation failed: %s", err)
+	}
+	// Recorded only behind the quorum check: a genuine promise wrapped in a
+	// forged certificate is rejected, and a rejected message must not buy an
+	// entry.
+	k.recordVerifiedPromise(&pp)
+	return nil
+}
+
+// PaymentPromiseTimeout processes a payment promise after the timeout period
+func (ms msgServer) PaymentPromiseTimeout(goCtx context.Context, msg *types.MsgPaymentPromiseTimeout) (*types.MsgPaymentPromiseTimeoutResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	// Convert payment promise to internal format
+	pp := fibre.PaymentPromise{}
+	if err := pp.FromProto(&msg.PaymentPromise); err != nil {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "failed to convert payment promise: %s", err)
+	}
+
+	// Perform stateless validation (signature verification, format checks, etc.)
+	if err := ms.ValidatePromiseStateless(&pp); err != nil {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "payment promise validation failed: %s", err)
+	}
+
+	// Perform stateful verification (escrow account, balance, not already processed)
+	// Use ValidatePaymentPromiseStatefulForTimeout which allows expired promises
+	expirationTime, err := ms.ValidatePaymentPromiseStatefulForTimeout(ctx, &msg.PaymentPromise)
+	if err != nil {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "payment promise stateful verification failed: %s", err)
+	}
+
+	// Check if timeout period has passed
+	currentTime := ctx.BlockTime()
+	if currentTime.Before(expirationTime) {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "payment promise has not yet timed out. Timeout at: %s, current time: %s", expirationTime, currentTime)
+	}
+
+	// Calculate payment amount based on blob size and gas per byte (same as PayForFibre)
+	paymentAmount := ms.calculatePaymentAmount(ctx, msg.PaymentPromise.BlobSize)
+
+	promiseHash, err := pp.Hash()
+	if err != nil {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "failed to hash payment promise: %s", err)
+	}
+
+	// Get escrow account for the payment promise signer
+	signerPubKey := msg.PaymentPromise.SignerPublicKey
+	escrowSigner := sdk.AccAddress(signerPubKey.Address()).String()
+
+	escrowAccount, found := ms.GetEscrowAccount(ctx, escrowSigner)
+	if !found {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrNotFound, "escrow account not found for signer: %s", escrowSigner)
+	}
+
+	// Deduct payment from escrow account (may reduce pending withdrawals if needed)
+	if err := ms.deductPaymentFromEscrow(ctx, &escrowAccount, paymentAmount); err != nil {
+		return nil, err
+	}
+
+	// Record processed payment (timeout)
+	processedPayment := types.ProcessedPayment{
+		PaymentPromiseHash: promiseHash,
+		ProcessedAt:        ctx.BlockTime(),
+	}
+	ms.SetProcessedPayment(ctx, processedPayment)
+
+	// Emit event
+	event := types.NewEventPaymentPromiseTimeout(msg.Signer, escrowSigner, promiseHash)
+	if err := ctx.EventManager().EmitTypedEvent(event); err != nil {
+		return nil, err
+	}
+
+	return &types.MsgPaymentPromiseTimeoutResponse{}, nil
+}
+
+// UpdateFibreParams updates the fibre module parameters
+func (ms msgServer) UpdateFibreParams(goCtx context.Context, msg *types.MsgUpdateFibreParams) (*types.MsgUpdateFibreParamsResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	// Check if the signer is the module authority
+	if msg.Authority != ms.GetAuthority() {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrUnauthorized, "invalid authority; expected %s, got %s", ms.GetAuthority(), msg.Authority)
+	}
+
+	// Validate parameters before setting them
+	if err := msg.Params.Validate(); err != nil {
+		return nil, errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "invalid parameters: %s", err)
+	}
+
+	// Set the new parameters
+	ms.SetParams(ctx, msg.Params)
+
+	// Emit event
+	event := types.NewEventUpdateFibreParams(msg.Authority, msg.Params)
+	if err := ctx.EventManager().EmitTypedEvent(event); err != nil {
+		return nil, err
+	}
+
+	return &types.MsgUpdateFibreParamsResponse{}, nil
+}
+
+// deductPaymentFromEscrow deducts the payment amount from an escrow account.
+// If AvailableBalance is not enough but Balance covers the payment, it reduces pending
+// withdrawals (FIFO) by the shortfall amount.
+func (ms msgServer) deductPaymentFromEscrow(ctx sdk.Context, escrowAccount *types.EscrowAccount, paymentAmount sdk.Coin) error {
+	if escrowAccount.Balance.IsLT(paymentAmount) {
+		return errorsmod.Wrapf(sdkerrors.ErrInsufficientFunds, "insufficient balance: have %s, need %s", escrowAccount.Balance, paymentAmount)
+	}
+
+	// availableDeduction = min(AvailableBalance, paymentAmount)
+	availableDeduction := paymentAmount
+	if escrowAccount.AvailableBalance.IsLT(paymentAmount) {
+		availableDeduction = escrowAccount.AvailableBalance
+	}
+
+	// Deduct the full payment from the total balance (guaranteed sufficient by the check above).
+	escrowAccount.Balance = escrowAccount.Balance.Sub(paymentAmount)
+	// Only deduct what AvailableBalance can cover; the rest is locked in pending withdrawals.
+	escrowAccount.AvailableBalance = escrowAccount.AvailableBalance.Sub(availableDeduction)
+	ms.SetEscrowAccount(ctx, *escrowAccount)
+
+	// If AvailableBalance couldn't cover the full payment, cancel/reduce pending withdrawals (FIFO)
+	// by the shortfall amount so that Balance and AvailableBalance stay consistent.
+	shortfall := paymentAmount.Sub(availableDeduction)
+	if shortfall.IsPositive() {
+		if err := ms.ReduceWithdrawalsForPayment(ctx, escrowAccount.Signer, shortfall); err != nil {
+			return err
+		}
+	}
+
+	// Route the settled payment to the fee collector so it is distributed to
+	// validators and delegators like a regular data-availability fee. The
+	// escrow accounting above only shrinks Balance/AvailableBalance; without
+	// this transfer the coins would stay stranded in the module account and be
+	// paid to no one. The full payment leaves the module account regardless of
+	// how it was split between available balance and pending withdrawals.
+	if err := ms.bankKeeper.SendCoinsFromModuleToModule(ctx, types.ModuleName, authtypes.FeeCollectorName, sdk.NewCoins(paymentAmount)); err != nil {
+		return errorsmod.Wrap(err, "failed to send fibre payment to fee collector")
+	}
+
+	return nil
+}
+
+// calculatePaymentAmount calculates the payment amount for a fibre blob based on its size.
+func (ms msgServer) calculatePaymentAmount(_ sdk.Context, blobSize uint32) sdk.Coin {
+	return types.PaymentAmount(blobSize)
+}
+
+// ValidateValidatorSetAvailable returns an error if the validator set that signs
+// promises at promiseHeight is no longer stored, matching the error
+// ValidatePayForFibreSignatures returns.
+func (k Keeper) ValidateValidatorSetAvailable(ctx sdk.Context, promiseHeight int64) error {
+	height := k.certificateHistoricalHeight(ctx, promiseHeight)
+	if err := k.checkHistoricalInfo(ctx, height); err != nil {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "validator signature validation failed: failed to get historical validator set at height %d: %s", height, err)
+	}
+	return nil
+}
+
+// checkHistoricalInfo returns the error GetHistoricalInfo would for a missing
+// height, skipping the decode of a validator set the caller does not need.
+func (k Keeper) checkHistoricalInfo(ctx sdk.Context, height int64) error {
+	found, err := k.stakingKeeper.HasHistoricalInfo(ctx, height)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return stakingtypes.ErrNoHistoricalInfo
+	}
+	return nil
+}
+
+// validateValidatorSignatures checks signatures against the validator set that signs promises at height.
+func (k Keeper) validateValidatorSignatures(ctx sdk.Context, signBytes []byte, height int64, signatures [][]byte) error {
+	converted, err := k.certificateValidatorSet(ctx, height)
+	if err != nil {
+		return err
+	}
+	if err := checkSignatureCount(converted, signatures); err != nil {
+		return err
+	}
+	cmtValidators := converted.validators
+
+	valSet := validator.Set{
+		ValidatorSet: converted.set,
+		Height:       uint64(height),
+	}
+
+	sigSet := valSet.NewSignatureSet(quorumFraction, signBytes)
+
+	// Add all provided signatures to the signature set
+	for i, signature := range signatures {
+		if len(signature) == 0 {
+			continue // Skip empty signatures
+		}
+
+		// Add signature to set (this validates the signature internally)
+		hasEnough, err := sigSet.Add(cmtValidators[i], signature)
+		if err != nil {
+			return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "invalid signature at index %d: %s", i, err)
+		}
+		if hasEnough {
+			return nil
+		}
+	}
+
+	// Check if thresholds are met
+	_, err = sigSet.Signatures()
+	if err != nil {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "signature validation failed: %s", err)
+	}
+
+	return nil
+}

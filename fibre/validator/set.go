@@ -1,0 +1,238 @@
+package validator
+
+import (
+	"fmt"
+	"math/big"
+	"math/rand/v2"
+
+	"github.com/celestiaorg/celestia-app/v11/pkg/rsema1d"
+	"github.com/cometbft/cometbft/crypto"
+	cmtmath "github.com/cometbft/cometbft/libs/math"
+	core "github.com/cometbft/cometbft/types"
+)
+
+// Set wraps [*core.ValidatorSet] with the height at which it is valid.
+type Set struct {
+	*core.ValidatorSet
+	Height uint64
+}
+
+// GetByAddress finds a validator in the set by address.
+// Returns the validator pointer from ValidatorSet.Validators (required for shard map lookups)
+// and true if found, or nil and false if not found.
+func (s Set) GetByAddress(address crypto.Address) (*core.Validator, bool) {
+	for _, val := range s.Validators {
+		if val.Address.String() == address.String() {
+			return val, true
+		}
+	}
+	return nil, false
+}
+
+// SelectedValidator pairs a validator with its expected row count for download scheduling.
+type SelectedValidator struct {
+	*core.Validator
+	ExpectedRows int
+}
+
+func (s Set) rowsPerValidator(originalRows, minRows int, livenessThreshold cmtmath.Fraction) []int {
+	rowsPerValidator := make([]int, len(s.Validators))
+	for i, v := range s.Validators {
+		rowsPerValidator[i] = s.AssignedRows(v, originalRows, minRows, livenessThreshold)
+	}
+	return rowsPerValidator
+}
+
+// ShardMap maps validators to the row indices they are assigned.
+type ShardMap map[*core.Validator][]int
+
+// Assign returns a ShardMap containing all validators and their assigned row indices
+// for the given commitment.
+//
+// Rows are distributed based on the relation: originalRows / rows = livenessThreshold / stake%
+// This means 33% stake should have originalRows (4096), so each validator gets:
+// rows = ceil(originalRows * stake% / livenessThreshold)
+//
+// The minRows parameter ensures every validator receives at least that many rows
+// for unique decodability security, even if their proportional share would be less.
+//
+// When the sum of assigned rows exceeds totalRows (due to minRows floor guarantees),
+// row indices wrap around using modulo arithmetic. This means the same row may be
+// assigned to multiple validators, ensuring all validators receive their required
+// minimum while maintaining deterministic assignment.
+//
+// It uses a ChaCha8 RNG seeded with the commitment to shuffle the row indices
+// using the Fisher-Yates algorithm, ensuring deterministic and uniform distribution.
+func (s Set) Assign(commitment rsema1d.Commitment, totalRows, originalRows, minRows int, livenessThreshold cmtmath.Fraction) ShardMap {
+	if len(s.Validators) == 0 || totalRows == 0 || minRows == 0 {
+		return make(ShardMap)
+	}
+
+	// rows = ceil(originalRows * stake% / livenessThreshold)
+	//      = ceil(originalRows * votingPower * denominator / (totalVotingPower * numerator))
+	// Capped at originalRows since that's all needed for reconstruction.
+	rowsPerValidator := s.rowsPerValidator(originalRows, minRows, livenessThreshold)
+
+	var seed [32]byte
+	copy(seed[:], commitment[:])
+
+	// chacha8 RNG with seed being the commitment
+	rng := rand.New(rand.NewChaCha8(seed))
+
+	// shuffle all totalRows indices with Fisher-Yates algorithm
+	// NOTE: std library Shuffle implements Fisher-Yates algorithm
+	rowsIndices := make([]int, totalRows)
+	for i := range totalRows {
+		rowsIndices[i] = i
+	}
+	rng.Shuffle(totalRows, func(i, j int) {
+		rowsIndices[i], rowsIndices[j] = rowsIndices[j], rowsIndices[i]
+	})
+
+	// assign rows to validators, wrapping around with modulo if total assigned exceeds totalRows
+	shardMap := make(ShardMap)
+	offset := 0
+	for i, validator := range s.Validators {
+		rows := make([]int, rowsPerValidator[i])
+		for j := range rows {
+			// modulo ensures wrap-around when minRows causes over-assignment
+			rows[j] = rowsIndices[(offset+j)%totalRows]
+		}
+		shardMap[validator] = rows
+		offset += rowsPerValidator[i]
+	}
+
+	return shardMap
+}
+
+// AssignedRows returns the rows assigned to val
+func (s Set) AssignedRows(val *core.Validator, originalRows, minRows int, lt cmtmath.Fraction) int {
+	// big.Int keeps the products exact for any voting power.
+	num := new(big.Int).Mul(big.NewInt(int64(originalRows)), big.NewInt(val.VotingPower))
+	num.Mul(num, new(big.Int).SetUint64(lt.Denominator))
+	den := new(big.Int).Mul(big.NewInt(s.TotalVotingPower()), new(big.Int).SetUint64(lt.Numerator))
+	rows := ceilDiv(num, den)
+	if rows.Cmp(big.NewInt(int64(originalRows))) > 0 {
+		return originalRows
+	}
+	return min(max(int(rows.Int64()), minRows), originalRows)
+}
+
+// ceilDiv returns ceil(num / den) for non-negative num and positive den.
+func ceilDiv(num, den *big.Int) *big.Int {
+	q, r := new(big.Int).QuoRem(num, den, new(big.Int))
+	if r.Sign() > 0 {
+		q.Add(q, big.NewInt(1))
+	}
+	return q
+}
+
+// Select returns validators to download shards from, shuffled by stake for load balancing.
+// Each [SelectedValidator] includes the expected row count for inflight estimation.
+// Validators before the split point have non-overlapping row assignments;
+// validators after it may share rows due to wrap-around.
+// Both groups are shuffled by stake so higher-stake validators are tried first.
+func (s Set) Select(originalRows, minRows int, livenessThreshold cmtmath.Fraction) []SelectedValidator {
+	if len(s.Validators) == 0 {
+		return nil
+	}
+
+	// Build paired slice so expected rows stay aligned through shuffling
+	rpv := s.rowsPerValidator(originalRows, minRows, livenessThreshold)
+	selected := make([]SelectedValidator, len(s.Validators))
+	for i, v := range s.Validators {
+		selected[i] = SelectedValidator{Validator: v, ExpectedRows: rpv[i]}
+	}
+
+	// find split point where row assignments start overlapping
+	// each validator contributes max(their stake, minStake) where minStake ensures unique decodability
+	totalStake := s.TotalVotingPower()
+	// big.Int keeps the products exact for any voting power.
+	totalDistributedRows := new(big.Int).Mul(big.NewInt(int64(originalRows)), new(big.Int).SetUint64(livenessThreshold.Denominator))
+	totalDistributedRows.Quo(totalDistributedRows, new(big.Int).SetUint64(livenessThreshold.Numerator))
+	minStakeBig := ceilDiv(new(big.Int).Mul(big.NewInt(int64(minRows)), big.NewInt(totalStake)), totalDistributedRows)
+	// Any minStake above totalStake splits at the first validator, so clamping
+	// it to totalStake+1 keeps the result and avoids overflow below.
+	minStake := totalStake + 1
+	if minStakeBig.Cmp(big.NewInt(minStake)) < 0 {
+		minStake = minStakeBig.Int64()
+	}
+
+	accumulated := int64(0)
+	splitIdx := len(selected)
+	for i := range selected {
+		accumulated += max(selected[i].VotingPower, minStake)
+		if accumulated > totalStake {
+			splitIdx = i
+			break
+		}
+	}
+
+	// shuffle each group by stake for load balancing
+	// NOTE: doesn't require cryptographic randomness
+	rng := rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
+	shuffleByStake(selected[:splitIdx], rng)
+	shuffleByStake(selected[splitIdx:], rng)
+
+	return selected
+}
+
+// shuffleByStake shuffles selected validators in-place using stake-weighted random selection.
+// Validators with higher voting power are more likely to appear earlier.
+func shuffleByStake(selected []SelectedValidator, rng *rand.Rand) {
+	for i := range len(selected) - 1 {
+		// calculate total weight of remaining validators
+		var totalWeight int64
+		for j := i; j < len(selected); j++ {
+			totalWeight += selected[j].VotingPower
+		}
+
+		// pick random point in weight space
+		point := rng.Int64N(totalWeight)
+
+		// find and swap the selected validator
+		var cumul int64
+		for j := i; j < len(selected); j++ {
+			cumul += selected[j].VotingPower
+			if point < cumul {
+				selected[i], selected[j] = selected[j], selected[i]
+				break
+			}
+		}
+	}
+}
+
+// Verify checks if all given row indices are assigned to [core.Validator].
+// Returns error if validator is not in the map, count doesn't match, any
+//
+//	row is not assigned or row indices are duplicate. This method builds
+//	a temporary set for O(r + n) complexity instead of O(n × r).
+func (sm ShardMap) Verify(val *core.Validator, rowIndices []uint32) error {
+	rows, ok := sm[val]
+	if !ok {
+		return fmt.Errorf("validator not in shard map")
+	}
+
+	// verify count matches total assigned
+	if len(rowIndices) != len(rows) {
+		return fmt.Errorf("expected %d rows, got %d", len(rows), len(rowIndices))
+	}
+
+	// Map each assigned row to whether it has been seen, reject duplicates.
+	assigned := make(map[uint32]bool, len(rows))
+	for _, idx := range rows {
+		assigned[uint32(idx)] = false
+	}
+
+	for _, rowIdx := range rowIndices {
+		seen, ok := assigned[rowIdx]
+		if !ok {
+			return fmt.Errorf("row %d not assigned to validator", rowIdx)
+		}
+		if seen {
+			return fmt.Errorf("duplicate row %d", rowIdx)
+		}
+		assigned[rowIdx] = true
+	}
+	return nil
+}

@@ -1,0 +1,511 @@
+package fibre
+
+import (
+	"context"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math/rand/v2"
+	"time"
+
+	"github.com/celestiaorg/celestia-app/v11/pkg/rsema1d"
+	"github.com/celestiaorg/celestia-app/v11/pkg/rsema1d/field"
+	"github.com/celestiaorg/celestia-app/v11/pkg/rsema1d/merkle"
+	"github.com/celestiaorg/celestia-app/v11/pkg/rsema1d/rlc"
+	"github.com/celestiaorg/celestia-app/v11/x/fibre/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	grpccodes "google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
+)
+
+// UploadShard handles the [types.FibreServer.UploadShard] RPC call.
+func (s *Server) UploadShard(ctx context.Context, req *types.UploadShardRequest) (_ *types.UploadShardResponse, err error) {
+	ctx, span := s.tracer.Start(ctx, "fibre.Server.UploadShard")
+	defer span.End()
+
+	var uploadSize int64
+	uploadShardDone := s.metrics.observeUploadShard(ctx)
+	defer func() { uploadShardDone(uploadSize, err) }()
+
+	promiseFailed := func(err error) error {
+		s.log.WarnContext(ctx, "payment promise verification failed", "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "payment promise verification failed")
+		if isUnavailable(err) {
+			return status.Error(grpccodes.InvalidArgument, "payment promise verification failed: app unavailable")
+		}
+		return status.Error(grpccodes.InvalidArgument, fmt.Sprintf("payment promise verification failed: %v", err))
+	}
+
+	// Cheap structural checks on the promise and the shard run first, so a
+	// malformed request is rejected before the signature check and any query
+	// to the app node.
+	promise, blobCfg, err := s.parsePromise(req.Promise)
+	if err != nil {
+		return nil, promiseFailed(err)
+	}
+
+	log := s.log.With("blob_commitment", promise.Commitment.String(), "promise_height", promise.Height)
+
+	// validate request shape before verifyAssignment/verifyShard dereference
+	// the shard. A peer can send UploadShard with the Shard field omitted,
+	// which would otherwise cause a nil-pointer panic in the handler.
+	if req.Shard == nil {
+		err := errors.New("shard is required")
+		log.WarnContext(ctx, "missing shard in upload request", "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "missing shard in upload request")
+		return nil, status.Error(grpccodes.InvalidArgument, err.Error())
+	}
+
+	promiseHash, err := promise.Hash()
+	if err != nil {
+		return nil, promiseFailed(fmt.Errorf("computing payment promise hash: %w", err))
+	}
+
+	// A local lookup: a stored shard was verified on its first upload, so a
+	// duplicate skips the shard checks below.
+	has, err := s.store.Has(ctx, promise.Commitment, promiseHash)
+	if err != nil {
+		log.ErrorContext(ctx, "failed to check store for existing shard", "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "store presence check failed")
+		return nil, status.Error(grpccodes.Internal, "failed to check if store has the commitment")
+	}
+
+	var (
+		rows []*rsema1d.RowProof
+		rlcs rlc.Vector
+	)
+	if !has {
+		rows, rlcs, err = checkShard(blobCfg, promise, req.Shard)
+		if err != nil {
+			log.WarnContext(ctx, "shard verification failed", "error", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "shard verification failed")
+			return nil, status.Error(grpccodes.InvalidArgument, fmt.Sprintf("shard verification failed: %v", err))
+		}
+	}
+
+	pruneAt, err := s.verifyPromise(ctx, promise, req.Promise)
+	if err != nil {
+		return nil, promiseFailed(err)
+	}
+	uploadSize = int64(promise.UploadSize)
+
+	span.AddEvent("promise_verified", trace.WithAttributes(
+		attribute.String("promise_hash", hex.EncodeToString(promiseHash)),
+		attribute.String("blob_commitment", promise.Commitment.String()),
+		attribute.Int64("promise_height", int64(promise.Height)),
+		attribute.String("namespace", promise.Namespace.String()),
+		attribute.Int64("upload_size", int64(promise.UploadSize)),
+	))
+
+	if has {
+		// Already stored: skip verification and storage, just re-sign.
+		s.observeDuplicateUpload(ctx, log, "before_verification")
+	} else {
+		// verify assignment - check that the shard belongs to us
+		if err := s.verifyAssignment(ctx, promise, blobCfg, req.Shard); err != nil {
+			log.WarnContext(ctx, "shard assignment verification failed", "error", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "shard assignment verification failed")
+			if isUnavailable(err) {
+				return nil, status.Error(grpccodes.InvalidArgument, "shard assignment verification failed: dependency unavailable")
+			}
+			return nil, status.Error(grpccodes.InvalidArgument, fmt.Sprintf("shard assignment verification failed: %v", err))
+		}
+		span.AddEvent("assignment_verified")
+
+		// verify row proofs using rsema1d and set RLC root
+		if err := s.verifyShard(ctx, promise, rows, rlcs); err != nil {
+			log.WarnContext(ctx, "shard verification failed", "error", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "shard verification failed")
+			return nil, status.Error(grpccodes.InvalidArgument, fmt.Sprintf("shard verification failed: %v", err))
+		}
+		span.AddEvent("shard_verified", trace.WithAttributes(
+			attribute.Int("row_size", len(req.Shard.Rows[0].Data)), // this must be valid, as we just verified the rows, so no panics
+			attribute.Int("rows_count", len(req.Shard.Rows)),
+		))
+
+		if err := s.storeShard(ctx, log, promise, promiseHash, pruneAt, req.Shard); err != nil {
+			return nil, err
+		}
+	}
+
+	// sign the payment promise
+	signStart := time.Now()
+	signature, err := SignPaymentPromiseValidator(promise, s.signer)
+	s.metrics.observeSign(ctx, signStart, err == nil)
+	if err != nil {
+		log.ErrorContext(ctx, "failed to sign payment promise", "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to sign payment promise")
+		return nil, status.Error(grpccodes.Internal, "failed to sign payment promise")
+	}
+	span.AddEvent("signature_generated")
+
+	span.SetStatus(codes.Ok, "")
+	return &types.UploadShardResponse{
+		ValidatorSignature: signature,
+	}, nil
+}
+
+// storeShard reserves storage capacity and writes a verified shard. It
+// serializes identical uploads so concurrent duplicates can't each reserve
+// occupancy for a single stored shard, and skips the write if the shard
+// was stored in the meantime. Errors are returned as gRPC statuses.
+func (s *Server) storeShard(ctx context.Context, log *slog.Logger, promise *PaymentPromise, promiseHash []byte, pruneAt time.Time, shard *types.BlobShard) error {
+	ctx, span := s.tracer.Start(ctx, "store_shard")
+	defer span.End()
+
+	release, err := s.uploads.acquire(ctx, promiseHash)
+	if err != nil {
+		return status.Error(cancellationCode(err), fmt.Sprintf("waiting for existing upload: %v", err))
+	}
+	defer release()
+
+	// Re-check now that we have the lock, to avoid TOCTOU
+	has, accounted, err := s.store.shardStatus(ctx, promise.Commitment, promiseHash)
+	if err != nil {
+		log.ErrorContext(ctx, "failed to check store for existing shard after locking", "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "store presence check failed")
+		return status.Error(grpccodes.Internal, "failed to check if store has the commitment")
+	}
+	if has {
+		s.observeDuplicateUpload(ctx, log, "after_verification")
+		return nil
+	}
+
+	size := shardBinarySize(shard)
+	newReservation := !accounted
+	if newReservation && !s.occ.reserve(size) {
+		s.metrics.uploadShardRejected.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", "budget_exceeded")))
+		st := status.New(grpccodes.ResourceExhausted, "fibre storage budget exceeded")
+		st, _ = st.WithDetails(&errdetails.RetryInfo{
+			RetryDelay: durationpb.New(retryAfterHint()),
+		})
+		return st.Err()
+	}
+
+	// store payment promise and shard with RLC roots
+	storePutStart := time.Now()
+	if err := s.store.Put(ctx, promise, shard, pruneAt); err != nil {
+		if newReservation {
+			s.occ.release(size)
+		}
+		s.metrics.observeStoreOp(ctx, s.metrics.storePutDuration, storePutStart, false)
+		// A cancelled/expired client context means the store deliberately
+		// skipped the commit; report it as such rather than as an Internal
+		// error so the caller (and metrics) can tell it apart from a real
+		// storage failure.
+		if ctxErr := context.Cause(ctx); ctxErr != nil {
+			log.WarnContext(ctx, "store upload aborted by client cancellation", "error", err)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "store upload aborted")
+			return status.Error(cancellationCode(ctxErr), "store upload aborted")
+		}
+		log.ErrorContext(ctx, "failed to store upload data", "error", err)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to store upload data")
+		return status.Error(grpccodes.Internal, "failed to store upload data")
+	}
+	s.metrics.observeStoreOp(ctx, s.metrics.storePutDuration, storePutStart, true)
+	span.AddEvent("shard_stored")
+
+	shardBytes := int64(len(shard.Rows)) * int64(len(shard.Rows[0].Data))
+	s.metrics.uploadShardBytes.Add(ctx, shardBytes)
+	log.DebugContext(ctx, "shard uploaded",
+		"upload_size", promise.UploadSize,
+		"shard_bytes", shardBytes,
+		"rows_count", len(shard.Rows),
+		"row_size", len(shard.Rows[0].Data),
+	)
+	return nil
+}
+
+// observeDuplicateUpload records an upload that was skipped because the
+// shard is already stored. stage says whether the duplicate was detected
+// before or after shard verification. The span event goes on the span
+// current in ctx, which already implies the stage.
+func (s *Server) observeDuplicateUpload(ctx context.Context, log *slog.Logger, stage string) {
+	s.metrics.uploadShardDupeHits.Add(ctx, 1, metric.WithAttributes(attribute.String("stage", stage)))
+	trace.SpanFromContext(ctx).AddEvent("shard_duplicate")
+	log.DebugContext(ctx, "shard upload skipped due to duplicate", "stage", stage)
+}
+
+// retryAfterHint returns how long a rejected client should wait before retrying.
+// Space frees only on prune ticks, so it waits at least one full prune interval,
+// plus up to half an interval of jitter to spread the synchronized retries of
+// many clients that hit a full store at the same time.
+func retryAfterHint() time.Duration {
+	return pruneInterval + time.Duration(rand.Int64N(int64(pruneInterval/2)))
+}
+
+// isUnavailable reports whether err comes from failing to reach the app node or
+// the signer, whose transport errors carry their address and stay in the server logs.
+func isUnavailable(err error) bool {
+	return status.Code(err) == grpccodes.Unavailable
+}
+
+// cancellationCode maps a context cancellation cause to the matching gRPC
+// status code so a deadline and an explicit cancel are reported distinctly.
+func cancellationCode(cause error) grpccodes.Code {
+	if errors.Is(cause, context.DeadlineExceeded) {
+		return grpccodes.DeadlineExceeded
+	}
+	return grpccodes.Canceled
+}
+
+// parsePromise runs the cheap checks on the proto of [PaymentPromise] and
+// returns its unmarshaled form with the BlobConfig for its blob version. It
+// does not verify the signature or query state; see [Server.verifyPromise].
+func (s *Server) parsePromise(promisePb *types.PaymentPromise) (*PaymentPromise, BlobConfig, error) {
+	// Reject anything the chain's stateless checks would reject: a promise that
+	// fails ValidateBasic can never be settled by MsgPayForFibre or
+	// MsgPaymentPromiseTimeout, so storing and signing for it is unpaid work.
+	if promisePb == nil {
+		return nil, BlobConfig{}, errors.New("nil payment promise")
+	}
+	if err := promisePb.ValidateBasic(); err != nil {
+		return nil, BlobConfig{}, fmt.Errorf("invalid payment promise: %w", err)
+	}
+
+	promise := &PaymentPromise{}
+	if err := promise.FromProto(promisePb); err != nil {
+		return nil, BlobConfig{}, fmt.Errorf("invalid payment promise proto: %w", err)
+	}
+
+	// validate PP chain ID matches the connected app chain ID
+	chainID := s.state.ChainID()
+	if promise.ChainID != chainID {
+		return nil, BlobConfig{}, fmt.Errorf("payment promise chain ID mismatch: expected %s, got %s", chainID, promise.ChainID)
+	}
+	// validate blob version is supported
+	blobCfg, err := BlobConfigForVersion(uint8(promise.BlobVersion))
+	if err != nil {
+		return nil, BlobConfig{}, fmt.Errorf("unsupported blob version %d: %w", promise.BlobVersion, err)
+	}
+
+	// Reject below the local minimum before reserving escrow through the state
+	// query or doing shard verification, storage, and signing.
+	if uint64(promise.UploadSize) < uint64(s.Config.MinUploadSize) {
+		return nil, BlobConfig{}, fmt.Errorf("upload size %d is below local minimum %d bytes", promise.UploadSize, s.Config.MinUploadSize)
+	}
+	return promise, blobCfg, nil
+}
+
+// verifyPromise verifies the signature and the stateful constraints of a
+// promise that passed [Server.parsePromise], and returns the pruneAt time
+// computed by shardPruneAt.
+func (s *Server) verifyPromise(ctx context.Context, promise *PaymentPromise, promisePb *types.PaymentPromise) (time.Time, error) {
+	// stateless validation, including the signature
+	if err := promise.Validate(); err != nil {
+		return time.Time{}, fmt.Errorf("payment promise validation failed: %w", err)
+	}
+
+	// validate stateful constraints
+	verifyResult, err := s.state.VerifyPromise(ctx, promisePb)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("stateful validation: %w", err)
+	}
+	return shardPruneAt(promise.CreationTimestamp, verifyResult.ExpiresAt, verifyResult.ShardRetention), nil
+}
+
+// shardPruneAt returns when an uploaded shard should be pruned. It anchors on
+// creationTimestamp (not time.Now) so re-Puts of the same shard stay idempotent
+// (see pruneKey in store.go) and never returns before expiresAt, so a shard is
+// not pruned while its payment promise is still valid.
+func shardPruneAt(creationTimestamp, expiresAt time.Time, retention time.Duration) time.Time {
+	floor := creationTimestamp.Add(retention)
+	if expiresAt.After(floor) {
+		return expiresAt
+	}
+	return floor
+}
+
+// verifyAssignment verifies that the [types.BlobShard] in the request is assigned to this validator.
+// It fetches the validator set at the promise height, identifies this validator,
+// computes the shard map, and checks that every row index belongs to this validator.
+func (s *Server) verifyAssignment(ctx context.Context, promise *PaymentPromise, blobCfg BlobConfig, shard *types.BlobShard) error {
+	valSet, err := s.state.GetByHeight(ctx, promise.Height)
+	if err != nil {
+		return fmt.Errorf("getting validator set at height %d: %w", promise.Height, err)
+	}
+
+	pubKey, err := s.signer.GetPubKey()
+	if err != nil {
+		return fmt.Errorf("getting validator public key: %w", err)
+	}
+
+	ourValidator, found := valSet.GetByAddress(pubKey.Address())
+	if !found {
+		return fmt.Errorf("validator %s not in set at height %d", pubKey.Address(), promise.Height)
+	}
+
+	// compute and verify assignment of rows in the request are assigned to us
+	rowIndices := make([]uint32, len(shard.Rows))
+	for i, row := range shard.GetRows() {
+		rowIndices[i] = row.Index
+	}
+	shardMap := valSet.Assign(promise.Commitment, blobCfg.TotalRows(), blobCfg.OriginalRows, s.Config.MinRowsPerValidator, s.Config.LivenessThreshold)
+	if err := shardMap.Verify(ourValidator, rowIndices); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// checkShard runs the structural checks on a shard that need neither the
+// validator assignment nor state: row sizes, proof shapes and RLC length. It
+// returns the parsed rows and RLCs for [Server.verifyShard].
+func checkShard(blobCfg BlobConfig, promise *PaymentPromise, shard *types.BlobShard) ([]*rsema1d.RowProof, rlc.Vector, error) {
+	rowSize, err := parseRowSize(shard.Rows)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// reject oversized rows: a row larger than MaxRowSize cannot be backed by
+	// the protocol's row pool on the read side and must never be signed/stored.
+	if blobCfg.MaxRowSize > 0 && rowSize > blobCfg.MaxRowSize {
+		return nil, nil, fmt.Errorf("row size %d exceeds maximum %d", rowSize, blobCfg.MaxRowSize)
+	}
+
+	// validate upload size matches the row size
+	expectedUploadSize := rowSize * blobCfg.OriginalRows
+	if int(promise.UploadSize) != expectedUploadSize {
+		return nil, nil, fmt.Errorf("upload size mismatch: promise has %d, but row size %d * %d original rows = %d",
+			promise.UploadSize, rowSize, blobCfg.OriginalRows, expectedUploadSize)
+	}
+
+	// v0 requires exactly one GF128 value per original row. byte length is fixed and
+	// known up front.
+	expectedRLCBytes := blobCfg.OriginalRows * field.GF128Size
+	if len(shard.GetRlcs()) != expectedRLCBytes {
+		return nil, nil, fmt.Errorf("expected %d RLC bytes, got %d", expectedRLCBytes, len(shard.GetRlcs()))
+	}
+
+	rlcs, err := rlc.Unmarshal(shard.GetRlcs())
+	if err != nil {
+		return nil, nil, err
+	}
+
+	rows := make([]*rsema1d.RowProof, len(shard.Rows))
+	for i, rowPb := range shard.Rows {
+		row, err := parseRow(rowPb)
+		if err != nil {
+			return nil, nil, err
+		}
+		rows[i] = row
+	}
+	return rows, rlcs, nil
+}
+
+// verifyShard verifies rows and RLCs from [checkShard] against the promise
+// commitment using a pooled [rsema1d.Verifier], blocking until one is free.
+func (s *Server) verifyShard(ctx context.Context, promise *PaymentPromise, rows []*rsema1d.RowProof, rlcs rlc.Vector) error {
+	verifier, err := s.getVerifier(ctx)
+	if err != nil {
+		return fmt.Errorf("acquiring verifier: %w", err)
+	}
+	defer s.putVerifier(verifier)
+
+	if err := verifier.Verify(promise.Commitment, rows, rlcs); err != nil {
+		return fmt.Errorf("shard row verification failed: %w", err)
+	}
+
+	return nil
+}
+
+// newVerifierPool eagerly populates a buffered channel with n Verifiers
+// for the v0 blob layout, each pinned to WorkerCount=1 (concurrency is
+// the channel capacity).
+func newVerifierPool(n int) chan *rsema1d.Verifier {
+	blobCfg := DefaultBlobConfigV0()
+	verifiers := make(chan *rsema1d.Verifier, n)
+	for i := range n {
+		v, err := rsema1d.NewVerifier(&rsema1d.Config{
+			K:           blobCfg.OriginalRows,
+			N:           blobCfg.ParityRows,
+			WorkerCount: 1,
+		})
+		if err != nil {
+			panic(fmt.Sprintf("creating verifier %d: %v", i, err))
+		}
+		verifiers <- v
+	}
+	return verifiers
+}
+
+// getVerifier returns a Verifier from the pool, blocking until one is free
+// or ctx is cancelled. Pair with putVerifier.
+func (s *Server) getVerifier(ctx context.Context) (*rsema1d.Verifier, error) {
+	select {
+	case v := <-s.verifiers:
+		return v, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// putVerifier returns a Verifier to the pool. The channel is sized to pool
+// capacity, so this never blocks for any verifier previously obtained via
+// getVerifier.
+func (s *Server) putVerifier(v *rsema1d.Verifier) {
+	if v == nil {
+		return
+	}
+	s.verifiers <- v
+}
+
+// parseRowSize determines and validates the row size from all rows.
+// Ensures that all rows have the same size.
+func parseRowSize(rows []*types.BlobRow) (int, error) {
+	if len(rows) == 0 {
+		return 0, errors.New("no rows provided")
+	}
+	rowSize := len(rows[0].Data)
+	if rowSize == 0 {
+		return 0, errors.New("row size cannot be zero")
+	}
+
+	// validate all rows have the same size
+	for i := 1; i < len(rows); i++ {
+		if len(rows[i].Data) != rowSize {
+			return 0, fmt.Errorf("row %d has size %d, expected %d (all rows must have the same size)", i, len(rows[i].Data), rowSize)
+		}
+	}
+
+	return rowSize, nil
+}
+
+// parseRow validates and converts a single proto row to rsema1d.RowProof format.
+func parseRow(row *types.BlobRow) (*rsema1d.RowProof, error) {
+	if len(row.Proof) == 0 {
+		return nil, fmt.Errorf("row %d missing proof", row.Index)
+	}
+	if len(row.Data) == 0 {
+		return nil, fmt.Errorf("row %d missing data", row.Index)
+	}
+	// Reject non canonical segment lengths so padding past the required
+	// NodeSize prefix can't be persisted and served.
+	for i, seg := range row.Proof {
+		if len(seg) != merkle.NodeSize {
+			return nil, fmt.Errorf("row %d proof segment %d must be %d bytes, got %d", row.Index, i, merkle.NodeSize, len(seg))
+		}
+	}
+
+	return &rsema1d.RowProof{
+		Index:    int(row.Index),
+		Row:      row.Data,
+		RowProof: row.Proof,
+	}, nil
+}

@@ -1,0 +1,15 @@
+# Parameters
+
+The parameters in the application depend on the app version:
+
+- [Parameters v1](./parameters_v1.md)
+- [Parameters v2](./parameters_v2.md)
+- [Parameters v3](./parameters_v3.md)
+- [Parameters v4](./parameters_v4.md)
+- [Parameters v5](./parameters_v5.md)
+- [Parameters v6](./parameters_v6.md)
+- [Parameters v7](./parameters_v7.md)
+- [Parameters v8](./parameters_v8.md)
+- [Parameters v9](./parameters_v9.md)
+- [Parameters v10](./parameters_v10.md)
+- [Parameters v11](./parameters_v11.md)

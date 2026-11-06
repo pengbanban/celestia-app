@@ -1,0 +1,706 @@
+package ante
+
+import (
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	storetypes "cosmossdk.io/store/types"
+	"github.com/celestiaorg/celestia-app/v11/pkg/sigcache"
+	fibretypes "github.com/celestiaorg/celestia-app/v11/x/fibre/types"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/stretchr/testify/require"
+	protov2 "google.golang.org/protobuf/proto"
+)
+
+func TestFibreSignatureGasDecoratorConsumesGasOnAllPaths(t *testing.T) {
+	decorator := NewFibreSignatureGasDecorator()
+	tx := mockTx{msgs: []sdk.Msg{newPayForFibreMsgWithSignatures(3)}}
+	expectedGas := fibretypes.EstimateGasForPayForFibreSignatureVerification(3)
+
+	for _, simulate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("simulate %t", simulate), func(t *testing.T) {
+			ctx := sdk.Context{}.WithGasMeter(storetypes.NewGasMeter(expectedGas))
+			nextCalled := false
+
+			gotCtx, err := decorator.AnteHandle(ctx, tx, simulate, func(ctx sdk.Context, _ sdk.Tx, gotSimulate bool) (sdk.Context, error) {
+				nextCalled = true
+				require.Equal(t, simulate, gotSimulate)
+				return ctx, nil
+			})
+
+			require.NoError(t, err)
+			require.True(t, nextCalled)
+			require.Equal(t, expectedGas, gotCtx.GasMeter().GasConsumed())
+		})
+	}
+}
+
+func TestFibreSignatureGasDecoratorSkipsNonSinglePFFTx(t *testing.T) {
+	decorator := NewFibreSignatureGasDecorator()
+	tx := mockTx{msgs: []sdk.Msg{
+		newPayForFibreMsgWithSignatures(1),
+		newPayForFibreMsgWithSignatures(1),
+	}}
+	ctx := sdk.Context{}.WithGasMeter(storetypes.NewGasMeter(1))
+
+	gotCtx, err := decorator.AnteHandle(ctx, tx, false, nextNoop)
+
+	require.NoError(t, err)
+	require.Zero(t, gotCtx.GasMeter().GasConsumed())
+}
+
+func TestFibreSignatureVerificationDecoratorSimulationSkipsVerification(t *testing.T) {
+	tx := mockTx{msgs: []sdk.Msg{newPayForFibreMsgWithSignatures(1)}}
+	keeper := &fakeFibreKeeper{}
+	cache := &fakeSigCache{
+		t:                 t,
+		failOnCacheLookup: true,
+		failOnCacheWrite:  true,
+	}
+	decorator := FibreSignatureVerificationDecorator{
+		k:           keeper,
+		pffSigCache: cache,
+	}
+	ctx := sdk.Context{}.
+		WithGasMeter(storetypes.NewGasMeter(1)).
+		WithTxBytes([]byte{0x01})
+
+	gotCtx, err := decorator.AnteHandle(ctx, tx, true, nextNoop)
+
+	require.NoError(t, err)
+	require.Zero(t, keeper.calls)
+	require.Zero(t, gotCtx.GasMeter().GasConsumed())
+}
+
+func TestFibreSignatureVerificationDecoratorSkipsVerificationModes(t *testing.T) {
+	// Finalize never verifies PFF signatures; recheck would only redo a check
+	// CheckTx already made over immutable promise bytes.
+	modes := map[string]sdk.ExecMode{
+		"finalize": sdk.ExecModeFinalize,
+		"recheck":  sdk.ExecModeReCheck,
+	}
+
+	for name, mode := range modes {
+		t.Run(name, func(t *testing.T) {
+			tx := mockTx{msgs: []sdk.Msg{newPayForFibreMsgWithSignatures(1)}}
+			keeper := &fakeFibreKeeper{err: errors.New("verification must not run")}
+			cache := &fakeSigCache{
+				t:                 t,
+				failOnCacheLookup: true,
+				failOnCacheWrite:  true,
+			}
+			decorator := FibreSignatureVerificationDecorator{
+				k:           keeper,
+				pffSigCache: cache,
+			}
+			ctx := sdk.Context{}.
+				WithGasMeter(storetypes.NewGasMeter(1)).
+				WithTxBytes([]byte{0x01}).
+				WithExecMode(mode)
+
+			gotCtx, err := decorator.AnteHandle(ctx, tx, false, nextNoop)
+
+			require.NoError(t, err)
+			require.Zero(t, keeper.calls)
+			require.Zero(t, gotCtx.GasMeter().GasConsumed())
+		})
+	}
+}
+
+func TestFibreSignatureVerificationDecoratorCacheHitSkipsVerification(t *testing.T) {
+	msg := newPayForFibreMsgWithSignatures(1)
+	tx := mockTx{msgs: []sdk.Msg{msg}}
+	keeper := &fakeFibreKeeper{}
+	cache := &fakeSigCache{
+		t:                t,
+		cacheHit:         true,
+		wantKey:          mustPffSigCacheKey(t, msg),
+		failOnCacheWrite: true,
+	}
+	decorator := FibreSignatureVerificationDecorator{
+		k:           keeper,
+		pffSigCache: cache,
+	}
+	ctx := sdk.Context{}.
+		WithGasMeter(storetypes.NewGasMeter(1)).
+		WithTxBytes([]byte{0x01})
+
+	gotCtx, err := decorator.AnteHandle(ctx, tx, false, nextNoop)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, cache.cacheLookups)
+	require.Zero(t, keeper.calls)
+	require.Zero(t, gotCtx.GasMeter().GasConsumed())
+}
+
+func TestFibreSignatureVerificationDecoratorCacheHitRequiresValidatorSet(t *testing.T) {
+	msg := newPayForFibreMsgWithSignatures(1)
+	expectedErr := errors.New("no historical info")
+	keeper := &fakeFibreKeeper{validatorSetErr: expectedErr}
+	cache := &fakeSigCache{
+		t:                t,
+		cacheHit:         true,
+		failOnCacheWrite: true,
+	}
+	decorator := FibreSignatureVerificationDecorator{k: keeper, pffSigCache: cache}
+	nextCalled := false
+
+	_, err := decorator.AnteHandle(sdk.Context{}.WithGasMeter(storetypes.NewGasMeter(1)), mockTx{msgs: []sdk.Msg{msg}}, false, nextRecorder(&nextCalled))
+
+	require.ErrorIs(t, err, expectedErr)
+	require.False(t, nextCalled)
+	require.Equal(t, 1, keeper.validatorSetCalls)
+	require.Equal(t, 1, keeper.infiniteGasCalls)
+	require.Zero(t, keeper.calls)
+}
+
+func TestFibreSignatureVerificationDecoratorVerifiesCacheMissWithInfiniteGas(t *testing.T) {
+	txBytes := []byte{0x01, 0x02, 0x03}
+	msg := newPayForFibreMsgWithSignatures(2)
+	tx := mockTx{msgs: []sdk.Msg{msg}}
+	keeper := &fakeFibreKeeper{
+		gasToConsume: 1_000_000,
+	}
+	cache := &fakeSigCache{
+		t:       t,
+		wantKey: mustPffSigCacheKey(t, msg),
+	}
+	decorator := FibreSignatureVerificationDecorator{
+		k:           keeper,
+		pffSigCache: cache,
+	}
+	ctx := sdk.Context{}.
+		WithGasMeter(storetypes.NewGasMeter(1)).
+		WithTxBytes(txBytes)
+
+	gotCtx, err := decorator.AnteHandle(ctx, tx, false, nextNoop)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, keeper.calls)
+	require.Equal(t, 1, keeper.infiniteGasCalls)
+	require.Equal(t, 1, cache.cachedTxs)
+	require.Zero(t, gotCtx.GasMeter().GasConsumed())
+}
+
+func TestFibreSignatureVerificationDecoratorDoesNotCacheFailures(t *testing.T) {
+	expectedErr := errors.New("invalid signature")
+	keeper := &fakeFibreKeeper{err: expectedErr}
+	cache := &fakeSigCache{t: t}
+	nextCalled := false
+	decorator := FibreSignatureVerificationDecorator{
+		k:           keeper,
+		pffSigCache: cache,
+	}
+	ctx := sdk.Context{}.
+		WithGasMeter(storetypes.NewGasMeter(1)).
+		WithTxBytes([]byte{0x01})
+
+	_, err := decorator.AnteHandle(ctx, mockTx{msgs: []sdk.Msg{newPayForFibreMsgWithSignatures(1)}}, false, nextRecorder(&nextCalled))
+
+	require.ErrorIs(t, err, expectedErr)
+	require.Equal(t, 1, keeper.calls)
+	require.False(t, nextCalled)
+	require.Zero(t, cache.cachedTxs)
+}
+
+func TestPffSigCacheKey(t *testing.T) {
+	tests := map[string]struct {
+		mutate      func(*fibretypes.MsgPayForFibre)
+		wantSameKey bool
+	}{
+		"outer signer is not part of the key": {
+			mutate:      func(msg *fibretypes.MsgPayForFibre) { msg.Signer = "another-relayer" },
+			wantSameKey: true,
+		},
+		"payment promise changes the key": {
+			mutate:      func(msg *fibretypes.MsgPayForFibre) { msg.PaymentPromise.BlobSize++ },
+			wantSameKey: false,
+		},
+		"payment promise signature changes the key": {
+			mutate: func(msg *fibretypes.MsgPayForFibre) {
+				msg.PaymentPromise.Signature = []byte("different-promise-signature")
+			},
+			wantSameKey: false,
+		},
+		"validator signature changes the key": {
+			mutate: func(msg *fibretypes.MsgPayForFibre) {
+				msg.ValidatorSignatures[0] = []byte("different-validator-signature")
+			},
+			wantSameKey: false,
+		},
+		"validator signature order changes the key": {
+			mutate: func(msg *fibretypes.MsgPayForFibre) {
+				msg.ValidatorSignatures[0], msg.ValidatorSignatures[1] = msg.ValidatorSignatures[1], msg.ValidatorSignatures[0]
+			},
+			wantSameKey: false,
+		},
+		"concatenated signatures with identical bytes change the key": {
+			// Signatures {1}, {2} must not collide with the single signature {1, 2}.
+			mutate: func(msg *fibretypes.MsgPayForFibre) {
+				msg.ValidatorSignatures = [][]byte{{1, 2}}
+			},
+			wantSameKey: false,
+		},
+	}
+
+	baseKey := mustPffSigCacheKey(t, keyTestMsg())
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			candidate := keyTestMsg()
+			tc.mutate(candidate)
+			if tc.wantSameKey {
+				require.Equal(t, baseKey, mustPffSigCacheKey(t, candidate))
+			} else {
+				require.NotEqual(t, baseKey, mustPffSigCacheKey(t, candidate))
+			}
+		})
+	}
+}
+
+func TestFibreSignatureVerificationDecoratorVerifiesOncePerCertificate(t *testing.T) {
+	// Fee bumps, memo edits, new sequence numbers, and re-signed envelopes all
+	// surface as different raw tx bytes, so every case submits the second tx
+	// with different tx bytes than the first.
+	tests := map[string]struct {
+		mutate    func(*fibretypes.MsgPayForFibre)
+		wantCalls int
+	}{
+		"identical certificate resubmitted verifies once": {
+			mutate:    func(*fibretypes.MsgPayForFibre) {},
+			wantCalls: 1,
+		},
+		"same certificate from a different message signer verifies once": {
+			mutate:    func(msg *fibretypes.MsgPayForFibre) { msg.Signer = "another-relayer" },
+			wantCalls: 1,
+		},
+		"changed certificate is verified again": {
+			mutate:    func(msg *fibretypes.MsgPayForFibre) { msg.ValidatorSignatures[0] = []byte("different") },
+			wantCalls: 2,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			keeper := &fakeFibreKeeper{}
+			decorator := FibreSignatureVerificationDecorator{k: keeper, pffSigCache: newMemorySigCache()}
+			second := keyTestMsg()
+			tc.mutate(second)
+
+			for i, msg := range []*fibretypes.MsgPayForFibre{keyTestMsg(), second} {
+				ctx := sdk.Context{}.WithTxBytes([]byte{byte(i)})
+				_, err := decorator.AnteHandle(ctx, mockTx{msgs: []sdk.Msg{msg}}, false, nextNoop)
+				require.NoError(t, err)
+			}
+
+			require.Equal(t, tc.wantCalls, keeper.calls)
+		})
+	}
+}
+
+// mempoolExecModes are the exec modes in which settlement eligibility runs.
+var mempoolExecModes = map[string]sdk.ExecMode{
+	"check":   sdk.ExecModeCheck,
+	"recheck": sdk.ExecModeReCheck,
+}
+
+func TestFibreStatefulValidationDecoratorSkipsIneligibleModesAndTxs(t *testing.T) {
+	pffTx := mockTx{msgs: []sdk.Msg{newPayForFibreMsgWithSignatures(1)}}
+
+	tests := map[string]struct {
+		tx       sdk.Tx
+		simulate bool
+		execMode sdk.ExecMode
+	}{
+		"tx without messages": {
+			tx:       mockTx{},
+			execMode: sdk.ExecModeCheck,
+		},
+		"tx with a single non-PFF message": {
+			tx:       mockTx{msgs: []sdk.Msg{&fibretypes.MsgDepositToEscrow{}}},
+			execMode: sdk.ExecModeCheck,
+		},
+		"tx with multiple messages": {
+			tx:       mockTx{msgs: []sdk.Msg{newPayForFibreMsgWithSignatures(1), newPayForFibreMsgWithSignatures(1)}},
+			execMode: sdk.ExecModeCheck,
+		},
+		"simulation": {
+			tx:       pffTx,
+			simulate: true,
+			execMode: sdk.ExecModeCheck,
+		},
+		"finalize mode": {
+			tx:       pffTx,
+			execMode: sdk.ExecModeFinalize,
+		},
+		"prepare proposal mode": {
+			tx:       pffTx,
+			execMode: sdk.ExecModePrepareProposal,
+		},
+		"process proposal mode": {
+			tx:       pffTx,
+			execMode: sdk.ExecModeProcessProposal,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			keeper := &fakeFibreKeeper{err: errors.New("eligibility must not run")}
+			decorator := NewFibreStatefulValidationDecorator(keeper)
+			ctx := sdk.Context{}.WithExecMode(tc.execMode)
+			nextCalled := false
+
+			_, err := decorator.AnteHandle(ctx, tc.tx, tc.simulate, nextRecorder(&nextCalled))
+
+			require.NoError(t, err)
+			require.True(t, nextCalled)
+			require.Zero(t, keeper.calls)
+		})
+	}
+}
+
+func TestFibreStatefulValidationDecoratorChecksEligibilityWithInfiniteGas(t *testing.T) {
+	for name, execMode := range mempoolExecModes {
+		t.Run(name, func(t *testing.T) {
+			keeper := &fakeFibreKeeper{gasToConsume: 1_000_000}
+			decorator := NewFibreStatefulValidationDecorator(keeper)
+			ctx := sdk.Context{}.
+				WithGasMeter(storetypes.NewGasMeter(1)).
+				WithExecMode(execMode).
+				WithIsCheckTx(true)
+			nextCalled := false
+
+			gotCtx, err := decorator.AnteHandle(ctx, mockTx{msgs: []sdk.Msg{newPayForFibreMsgWithSignatures(1)}}, false, nextRecorder(&nextCalled))
+
+			require.NoError(t, err)
+			require.True(t, nextCalled)
+			require.Equal(t, 1, keeper.calls)
+			require.Equal(t, 1, keeper.infiniteGasCalls)
+			// Gas consumed by the eligibility check must not count against the tx.
+			require.Zero(t, gotCtx.GasMeter().GasConsumed())
+		})
+	}
+}
+
+func TestFibreStatefulValidationDecoratorRejectsIneligiblePromise(t *testing.T) {
+	for name, execMode := range mempoolExecModes {
+		t.Run(name, func(t *testing.T) {
+			expectedErr := errors.New("payment promise has already been processed")
+			keeper := &fakeFibreKeeper{err: expectedErr}
+			decorator := NewFibreStatefulValidationDecorator(keeper)
+			ctx := sdk.Context{}.WithExecMode(execMode).WithIsCheckTx(true)
+			nextCalled := false
+
+			_, err := decorator.AnteHandle(ctx, mockTx{msgs: []sdk.Msg{newPayForFibreMsgWithSignatures(1)}}, false, nextRecorder(&nextCalled))
+
+			require.ErrorIs(t, err, expectedErr)
+			require.False(t, nextCalled)
+			require.Equal(t, 1, keeper.calls)
+		})
+	}
+}
+
+// fakeFibreKeeper fakes both the signature and eligibility keeper interfaces.
+type fakeFibreKeeper struct {
+	calls            int
+	infiniteGasCalls int
+	gasToConsume     uint64
+	err              error
+
+	validatorSetCalls int
+	validatorSetErr   error
+	// preverifyCalls counts the pre-pass and preverified records its keys.
+	// records, when set, is the cache the pass warms.
+	preverifyCalls    int
+	preverifyInfinite int
+	preverified       []sigcache.Key
+	records           PffSigCache
+}
+
+func (f *fakeFibreKeeper) ValidatePayForFibreSignatures(ctx sdk.Context, _ *fibretypes.MsgPayForFibre) error {
+	f.observe(ctx)
+	return f.err
+}
+
+func (f *fakeFibreKeeper) ValidateValidatorSetAvailable(ctx sdk.Context, _ int64) error {
+	f.validatorSetCalls++
+	if ctx.GasMeter().Limit() == ^uint64(0) {
+		f.infiniteGasCalls++
+	}
+	return f.validatorSetErr
+}
+
+func (f *fakeFibreKeeper) PreverifyPayForFibreMsg(ctx sdk.Context, _ *fibretypes.MsgPayForFibre, certKey sigcache.Key) {
+	f.preverifyCalls++
+	if ctx.GasMeter().Limit() == ^uint64(0) {
+		f.preverifyInfinite++
+	}
+	f.preverified = append(f.preverified, certKey)
+	if f.records != nil {
+		f.records.Add(certKey)
+	}
+}
+
+func (f *fakeFibreKeeper) ValidatePaymentPromiseStateful(ctx sdk.Context, _ *fibretypes.PaymentPromise) (time.Time, error) {
+	f.observe(ctx)
+	return time.Time{}, f.err
+}
+
+// observe records the call, whether it ran with infinite gas, and consumes
+// gasToConsume from the caller's meter.
+func (f *fakeFibreKeeper) observe(ctx sdk.Context) {
+	f.calls++
+	if ctx.GasMeter().Limit() == ^uint64(0) {
+		f.infiniteGasCalls++
+	}
+	if f.gasToConsume > 0 {
+		ctx.GasMeter().ConsumeGas(f.gasToConsume, "fake verification")
+	}
+}
+
+type fakeSigCache struct {
+	t                 *testing.T
+	cacheLookups      int
+	cachedTxs         int
+	cacheHit          bool
+	wantKey           sigcache.Key
+	failOnCacheLookup bool
+	failOnCacheWrite  bool
+}
+
+type memorySigCache struct {
+	entries map[sigcache.Key]struct{}
+}
+
+func newMemorySigCache() *memorySigCache {
+	return &memorySigCache{entries: make(map[sigcache.Key]struct{})}
+}
+
+func (c *memorySigCache) Has(key sigcache.Key) bool {
+	_, ok := c.entries[key]
+	return ok
+}
+
+func (c *memorySigCache) Add(key sigcache.Key) {
+	c.entries[key] = struct{}{}
+}
+
+func (f *fakeSigCache) Has(key sigcache.Key) bool {
+	if f.failOnCacheLookup {
+		f.t.Fatal("cache lookup should be skipped")
+	}
+	f.cacheLookups++
+	f.requireKey(key)
+	return f.cacheHit
+}
+
+func (f *fakeSigCache) Add(key sigcache.Key) {
+	if f.failOnCacheWrite {
+		f.t.Fatal("cache write should be skipped")
+	}
+	f.cachedTxs++
+	f.requireKey(key)
+}
+
+func (f *fakeSigCache) requireKey(key sigcache.Key) {
+	if f.t != nil && f.wantKey != (sigcache.Key{}) {
+		require.Equal(f.t, f.wantKey, key)
+	}
+}
+
+type mockTx struct {
+	msgs []sdk.Msg
+}
+
+func (m mockTx) GetMsgs() []sdk.Msg {
+	return m.msgs
+}
+
+func (m mockTx) GetMsgsV2() ([]protov2.Message, error) {
+	return nil, nil
+}
+
+func newPayForFibreMsgWithSignatures(count int) *fibretypes.MsgPayForFibre {
+	signatures := make([][]byte, count)
+	for i := range signatures {
+		signatures[i] = []byte{byte(i + 1)}
+	}
+	return &fibretypes.MsgPayForFibre{ValidatorSignatures: signatures}
+}
+
+func keyTestMsg() *fibretypes.MsgPayForFibre {
+	msg := newPayForFibreMsgWithSignatures(2)
+	msg.Signer = "relayer"
+	msg.PaymentPromise.Signature = []byte("promise-signature")
+	return msg
+}
+
+func mustPffSigCacheKey(t *testing.T, msg *fibretypes.MsgPayForFibre) sigcache.Key {
+	t.Helper()
+	key, err := msg.SigCacheKey()
+	require.NoError(t, err)
+	return key
+}
+
+func nextNoop(ctx sdk.Context, _ sdk.Tx, _ bool) (sdk.Context, error) {
+	return ctx, nil
+}
+
+// nextRecorder returns an AnteHandler that records whether it was called.
+func nextRecorder(called *bool) sdk.AnteHandler {
+	return func(ctx sdk.Context, _ sdk.Tx, _ bool) (sdk.Context, error) {
+		*called = true
+		return ctx, nil
+	}
+}
+
+// TestFibreSignatureVerificationDecoratorUsesDecodedKey checks the decorator uses
+// the context's certificate key only when the view matches these tx bytes.
+func TestFibreSignatureVerificationDecoratorUsesDecodedKey(t *testing.T) {
+	txBytes := []byte{0x01, 0x02, 0x03}
+	msg := newPayForFibreMsgWithSignatures(1)
+	tx := mockTx{msgs: []sdk.Msg{msg}}
+	decodedKey := sigcache.NewKey(sigcache.PffCertificate, []byte("precomputed"))
+
+	t.Run("decoded view for these bytes", func(t *testing.T) {
+		keeper := &fakeFibreKeeper{}
+		cache := &fakeSigCache{t: t, cacheHit: true, wantKey: decodedKey, failOnCacheWrite: true}
+		decorator := FibreSignatureVerificationDecorator{k: keeper, pffSigCache: cache}
+		ctx := withCertKey(
+			sdk.Context{}.WithGasMeter(storetypes.NewGasMeter(1)).WithTxBytes(txBytes),
+			&fibretypes.DecodedPayForFibre{Raw: txBytes, CertKey: decodedKey, CertKeyed: true},
+		)
+
+		_, err := decorator.AnteHandle(ctx, tx, false, nextNoop)
+		require.NoError(t, err)
+		require.Equal(t, 1, cache.cacheLookups)
+		require.Zero(t, keeper.calls)
+	})
+
+	t.Run("decoded view for other bytes is ignored", func(t *testing.T) {
+		keeper := &fakeFibreKeeper{}
+		cache := &fakeSigCache{t: t, cacheHit: true, wantKey: mustPffSigCacheKey(t, msg), failOnCacheWrite: true}
+		decorator := FibreSignatureVerificationDecorator{k: keeper, pffSigCache: cache}
+		ctx := withCertKey(
+			sdk.Context{}.WithGasMeter(storetypes.NewGasMeter(1)).WithTxBytes(txBytes),
+			&fibretypes.DecodedPayForFibre{Raw: []byte{0x09}, CertKey: decodedKey, CertKeyed: true},
+		)
+
+		_, err := decorator.AnteHandle(ctx, tx, false, nextNoop)
+		require.NoError(t, err)
+		require.Equal(t, 1, cache.cacheLookups)
+		require.Zero(t, keeper.calls)
+	})
+}
+
+// TestFibreSignatureVerificationDecoratorPreverifiesOnlyInCheckTx pins where the
+// pass may run: CheckTx is the one phase reaching the decorator with a single
+// transaction and no block-level pass of its own.
+func TestFibreSignatureVerificationDecoratorPreverifiesOnlyInCheckTx(t *testing.T) {
+	tests := map[string]struct {
+		prepare       func(sdk.Context) sdk.Context
+		wantPreverify int
+		wantVerify    int
+	}{
+		"check":            {func(ctx sdk.Context) sdk.Context { return ctx.WithIsCheckTx(true) }, 1, 1},
+		"prepare proposal": {func(ctx sdk.Context) sdk.Context { return ctx.WithExecMode(sdk.ExecModePrepareProposal) }, 0, 1},
+		"process proposal": {func(ctx sdk.Context) sdk.Context { return ctx.WithExecMode(sdk.ExecModeProcessProposal) }, 0, 1},
+		"bare context":     {func(ctx sdk.Context) sdk.Context { return ctx }, 0, 1},
+		// Recheck leaves the decorator before either: it only ever revisits
+		// bytes CheckTx already admitted.
+		"recheck": {func(ctx sdk.Context) sdk.Context { return ctx.WithIsReCheckTx(true) }, 0, 0},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			msg := newPayForFibreMsgWithSignatures(1)
+			keeper := &fakeFibreKeeper{}
+			decorator := FibreSignatureVerificationDecorator{k: keeper, pffSigCache: newMemorySigCache()}
+			ctx := tc.prepare(sdk.Context{}.
+				WithGasMeter(storetypes.NewGasMeter(1)).
+				WithTxBytes([]byte{0x01}))
+
+			_, err := decorator.AnteHandle(ctx, mockTx{msgs: []sdk.Msg{msg}}, false, nextNoop)
+
+			require.NoError(t, err)
+			require.Equal(t, tc.wantPreverify, keeper.preverifyCalls)
+			require.Equal(t, tc.wantPreverify, keeper.preverifyInfinite,
+				"the pre-pass reads the historical validator set, which the tx's own gas limit must not bound")
+			// Either way the sequential verifier is the one that decides.
+			require.Equal(t, tc.wantVerify, keeper.calls)
+		})
+	}
+}
+
+// TestFibreSignatureVerificationDecoratorPreverifiesTheMessagesOwnKey pins what
+// the move buys: the pass is handed the key derived from the message, and a key
+// it warms spares the sequential verification.
+func TestFibreSignatureVerificationDecoratorPreverifiesTheMessagesOwnKey(t *testing.T) {
+	msg := newPayForFibreMsgWithSignatures(2)
+	cache := newMemorySigCache()
+	keeper := &fakeFibreKeeper{records: cache}
+	decorator := FibreSignatureVerificationDecorator{k: keeper, pffSigCache: cache}
+	ctx := sdk.Context{}.
+		WithGasMeter(storetypes.NewGasMeter(1)).
+		WithTxBytes([]byte{0x01}).
+		WithIsCheckTx(true)
+	nextCalled := false
+
+	_, err := decorator.AnteHandle(ctx, mockTx{msgs: []sdk.Msg{msg}}, false, nextRecorder(&nextCalled))
+
+	require.NoError(t, err)
+	require.True(t, nextCalled)
+	require.Equal(t, []sigcache.Key{mustPffSigCacheKey(t, msg)}, keeper.preverified)
+	require.Zero(t, keeper.calls, "a warmed certificate must not be verified again")
+}
+
+// TestFibreSignatureVerificationDecoratorVerifiesWhatThePrePassLeft covers the
+// pass failing: the cache stays cold and the sequential verifier reports the
+// error, exactly as it would have without a pass at all.
+func TestFibreSignatureVerificationDecoratorVerifiesWhatThePrePassLeft(t *testing.T) {
+	expectedErr := errors.New("invalid signature")
+	keeper := &fakeFibreKeeper{err: expectedErr}
+	cache := newMemorySigCache()
+	decorator := FibreSignatureVerificationDecorator{k: keeper, pffSigCache: cache}
+	ctx := sdk.Context{}.
+		WithGasMeter(storetypes.NewGasMeter(1)).
+		WithTxBytes([]byte{0x01}).
+		WithIsCheckTx(true)
+	nextCalled := false
+
+	_, err := decorator.AnteHandle(ctx, mockTx{msgs: []sdk.Msg{newPayForFibreMsgWithSignatures(1)}}, false, nextRecorder(&nextCalled))
+
+	require.ErrorIs(t, err, expectedErr)
+	require.False(t, nextCalled)
+	require.Equal(t, 1, keeper.preverifyCalls)
+	require.Equal(t, 1, keeper.calls)
+}
+
+// TestFibreSignatureVerificationDecoratorSkipsThePrePassOnACacheHit pins the
+// placement: the pass runs after the cache lookup, never before, or every
+// cached CheckTx would pay for a pass it cannot use.
+func TestFibreSignatureVerificationDecoratorSkipsThePrePassOnACacheHit(t *testing.T) {
+	msg := newPayForFibreMsgWithSignatures(1)
+	keeper := &fakeFibreKeeper{}
+	cache := newMemorySigCache()
+	cache.Add(mustPffSigCacheKey(t, msg))
+	decorator := FibreSignatureVerificationDecorator{k: keeper, pffSigCache: cache}
+	ctx := sdk.Context{}.
+		WithGasMeter(storetypes.NewGasMeter(1)).
+		WithTxBytes([]byte{0x01}).
+		WithIsCheckTx(true)
+
+	_, err := decorator.AnteHandle(ctx, mockTx{msgs: []sdk.Msg{msg}}, false, nextNoop)
+
+	require.NoError(t, err)
+	require.Zero(t, keeper.preverifyCalls)
+	require.Zero(t, keeper.calls)
+}
+
+// withCertKey attaches a fresh holder pointed at d.
+func withCertKey(ctx sdk.Context, d *fibretypes.DecodedPayForFibre) sdk.Context {
+	h := &fibretypes.CertKeyHolder{}
+	h.Set(d)
+	return fibretypes.WithCertKeyHolder(ctx, h)
+}

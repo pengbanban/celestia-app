@@ -1,0 +1,330 @@
+package fibre_test
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/celestiaorg/celestia-app/v11/fibre"
+	"github.com/celestiaorg/celestia-app/v11/fibre/state"
+	"github.com/celestiaorg/celestia-app/v11/fibre/validator"
+	"github.com/celestiaorg/celestia-app/v11/x/fibre/types"
+	"github.com/cometbft/cometbft/crypto"
+	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
+	core "github.com/cometbft/cometbft/types"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/stretchr/testify/require"
+)
+
+// makeTestServer creates a server with all necessary test infrastructure.
+func makeTestServer(t *testing.T) (*fibre.Server, validator.Set, *core.Validator) {
+	return makeTestServerWithConfig(t, nil)
+}
+
+// makeTestServerWithConfig is makeTestServer with an optional hook to tweak the
+// ServerConfig before construction (e.g. to set FullStakeStorageBudgetFn).
+func makeTestServerWithConfig(t testing.TB, modify func(*fibre.ServerConfig)) (*fibre.Server, validator.Set, *core.Validator) {
+	t.Helper()
+	cfg, valSet, serverValidator := makeTestServerConfig(t, modify)
+	server, err := fibre.NewServer(cfg)
+	require.NoError(t, err)
+
+	require.NoError(t, server.Start(t.Context()))
+	t.Cleanup(func() {
+		require.NoError(t, server.Stop(context.Background()))
+	})
+
+	return server, valSet, serverValidator
+}
+
+// makeTestServerConfig returns the ServerConfig makeTestServerWithConfig
+// builds a server from, with the validator set and the server's validator.
+// Every server built from it has the same identity and a fresh store.
+func makeTestServerConfig(t testing.TB, modify func(*fibre.ServerConfig)) (fibre.ServerConfig, validator.Set, *core.Validator) {
+	t.Helper()
+
+	// create validator set (use enough validators for good distribution)
+	validators, privKeys := makeTestValidators(t, 100)
+	valSet := validator.Set{
+		ValidatorSet: core.NewValidatorSet(validators),
+		Height:       100,
+	}
+
+	// use first validator as the server's identity
+	privVal := newTestPrivValidator(privKeys[0])
+
+	// find the server validator in the ValidatorSet by matching the address
+	// Note: core.NewValidatorSet may reorder validators, so we can't assume validators[0] == privKeys[0]
+	serverPubKey, err := privVal.GetPubKey()
+	require.NoError(t, err)
+	serverAddress := serverPubKey.Address()
+
+	serverValidator, found := valSet.GetByAddress(serverAddress)
+	require.True(t, found, "server validator not found in validator set")
+	require.NotNil(t, serverValidator, "server validator is nil")
+
+	valSetGetter := &mockValidatorSetGetter{set: valSet}
+
+	cfg := fibre.DefaultServerConfig()
+	cfg.ServerListenAddress = "127.0.0.1:0"
+	cfg.StateClientFn = func() (state.Client, error) {
+		return &mockStateClient{
+			chainID:   "celestia",
+			SetGetter: valSetGetter,
+			// Large default budget so the limiter is on but never rejects; budget
+			// tests wrap StateClientFn to set a small budget.
+			budget: int64(types.DefaultFullStakeStorageBudget),
+		}, nil
+	}
+	cfg.SignerFn = func(_ string) (core.PrivValidator, error) {
+		return privVal, nil
+	}
+
+	cfg.StoreFn = func(_ context.Context, scfg fibre.StoreConfig) (*fibre.Store, error) {
+		return fibre.NewMemoryStore(scfg), nil
+	}
+	if modify != nil {
+		modify(&cfg)
+	}
+	return cfg, valSet, serverValidator
+}
+
+// mockStateClient implements state.Client for testing.
+type mockStateClient struct {
+	validator.SetGetter
+	validator.HostRegistry
+	chainID string
+	// budget is returned by FullStakeStorageBudget; zero means the limiter is
+	// disabled (unlimited), matching the on-chain semantics.
+	budget int64
+}
+
+func (m *mockStateClient) Start(context.Context) error { return nil }
+func (m *mockStateClient) Stop(context.Context) error  { return nil }
+func (m *mockStateClient) ChainID() string             { return m.chainID }
+
+// Head fails without a SetGetter, so clients that pre-dial on Start work
+// with mocks that don't set one.
+func (m *mockStateClient) Head(ctx context.Context) (validator.Set, error) {
+	if m.SetGetter == nil {
+		return validator.Set{}, errors.New("no validator set")
+	}
+	return m.SetGetter.Head(ctx)
+}
+
+func (m *mockStateClient) FullStakeStorageBudget(context.Context) (int64, error) {
+	return m.budget, nil
+}
+
+func (m *mockStateClient) NodeStatus(context.Context) (state.NodeStatus, error) {
+	return state.NodeStatus{}, nil
+}
+
+func (m *mockStateClient) ProviderRegistration(context.Context, core.Address) (state.ProviderRegistration, error) {
+	return state.ProviderRegistration{}, nil
+}
+
+// withStateBudget returns a ServerConfig hook that sets the storage budget the
+// server derives. It wraps the harness's default StateClientFn — which already
+// wires the validator-set getter — and overrides only the mock's budget, so the
+// limiter is exercised with a specific FullStakeStorageBudget.
+func withStateBudget(budget int64) func(*fibre.ServerConfig) {
+	return func(cfg *fibre.ServerConfig) {
+		inner := cfg.StateClientFn
+		cfg.StateClientFn = func() (state.Client, error) {
+			c, err := inner()
+			if err != nil {
+				return nil, err
+			}
+			c.(*mockStateClient).budget = budget
+			return c, nil
+		}
+	}
+}
+
+func (m *mockStateClient) VerifyPromise(_ context.Context, promise *state.PaymentPromise) (state.VerifiedPromise, error) {
+	expirationTime := promise.CreationTimestamp.Add(1 * time.Hour)
+	if time.Now().After(expirationTime) || time.Now().Equal(expirationTime) {
+		return state.VerifiedPromise{}, fmt.Errorf("payment promise expired: creation_timestamp %v + timeout %v = %v",
+			promise.CreationTimestamp, 1*time.Hour, expirationTime)
+	}
+	return state.VerifiedPromise{ExpiresAt: expirationTime}, nil
+}
+
+// testPrivValidator is a simple mock PrivValidator for testing.
+type testPrivValidator struct {
+	privKey crypto.PrivKey
+}
+
+func newTestPrivValidator(privKey crypto.PrivKey) *testPrivValidator {
+	return &testPrivValidator{privKey: privKey}
+}
+
+func (m *testPrivValidator) GetPubKey() (crypto.PubKey, error) {
+	return m.privKey.PubKey(), nil
+}
+
+func (m *testPrivValidator) SignRawBytes(chainID, uniqueID string, rawBytes []byte) ([]byte, error) {
+	signBytes, err := core.RawBytesMessageSignBytes(chainID, uniqueID, rawBytes)
+	if err != nil {
+		return nil, err
+	}
+	return m.privKey.Sign(signBytes)
+}
+
+func (m *testPrivValidator) SignVote(chainID string, vote *cmtproto.Vote) error {
+	return nil
+}
+
+func (m *testPrivValidator) SignProposal(chainID string, proposal *cmtproto.Proposal) error {
+	return nil
+}
+
+func (m *testPrivValidator) GetAddress() core.Address {
+	return m.privKey.PubKey().Address()
+}
+
+func TestServerStartDerivesStoreIdentity(t *testing.T) {
+	var got fibre.StoreConfig
+	_, _, validator := makeTestServerWithConfig(t, func(cfg *fibre.ServerConfig) {
+		newState := cfg.StateClientFn
+		cfg.StateClientFn = func() (state.Client, error) {
+			client, err := newState()
+			return &startChainStateClient{Client: client}, err
+		}
+		cfg.StoreFn = func(ctx context.Context, scfg fibre.StoreConfig) (*fibre.Store, error) {
+			require.Same(t, t.Context(), ctx)
+			got = scfg
+			return fibre.NewMemoryStore(scfg), nil
+		}
+	})
+	require.Equal(t, "started-chain", got.ObjectStorage.ChainID)
+	require.Equal(t, sdk.ConsAddress(validator.Address).String(), got.ObjectStorage.ValidatorAddress)
+}
+
+type startChainStateClient struct {
+	state.Client
+	chainID string
+}
+
+func (s *startChainStateClient) Start(ctx context.Context) error {
+	if err := s.Client.Start(ctx); err != nil {
+		return err
+	}
+	s.chainID = "started-chain"
+	return nil
+}
+
+func (s *startChainStateClient) ChainID() string { return s.chainID }
+
+func TestServerStartFailsWhenStoreCannotOpen(t *testing.T) {
+	cfg := fibre.DefaultServerConfig()
+	cfg.ServerListenAddress = "127.0.0.1:0"
+	cfg.StateClientFn = func() (state.Client, error) {
+		return &mockStateClient{chainID: "test-chain"}, nil
+	}
+	cfg.SignerFn = func(string) (core.PrivValidator, error) {
+		return core.NewMockPV(), nil
+	}
+	wantErr := errors.New("cannot open store")
+	cfg.StoreFn = func(context.Context, fibre.StoreConfig) (*fibre.Store, error) { return nil, wantErr }
+	server, err := fibre.NewServer(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, server.Stop(context.Background())) })
+	require.ErrorIs(t, server.Start(t.Context()), wantErr)
+	require.Nil(t, server.Store())
+}
+
+func TestServerStartLogsStoreConfig(t *testing.T) {
+	var logs synchronizedLogBuffer
+	_, _, validator := makeTestServerWithConfig(t, func(cfg *fibre.ServerConfig) {
+		cfg.Log = slog.New(slog.NewTextHandler(&logs, nil))
+		cfg.StorageBackend = "object"
+		cfg.ObjectStorage.Endpoint = "https://account.r2.cloudflarestorage.com/api"
+		cfg.ObjectStorage.Region = "auto"
+		cfg.ObjectStorage.Bucket = "fibre-shards"
+		cfg.ObjectStorage.Prefix = "/fibre/./"
+	})
+
+	output := logs.String()
+	require.Contains(t, output, `msg="store ready"`)
+	require.Contains(t, output, "storage_backend=object")
+	require.Contains(t, output, "object_configured=true")
+	require.Contains(t, output, "object_markers_present=false")
+	require.Contains(t, output, "object_namespace.endpoint_host=account.r2.cloudflarestorage.com")
+	require.NotContains(t, output, "https://account.r2.cloudflarestorage.com/api")
+	require.Contains(t, output, "object_namespace.bucket=fibre-shards")
+	require.Contains(t, output, "object_namespace.prefix=fibre")
+	require.NotContains(t, output, "object_namespace.prefix=/fibre/./")
+	require.Contains(t, output, "object_namespace.chain_id=celestia")
+	require.Contains(t, output, "object_namespace.validator_address="+sdk.ConsAddress(validator.Address).String())
+}
+
+func TestServerStartLogsNormalizedObjectConfig(t *testing.T) {
+	var logs synchronizedLogBuffer
+	makeTestServerWithConfig(t, func(cfg *fibre.ServerConfig) {
+		cfg.Log = slog.New(slog.NewTextHandler(&logs, nil))
+		cfg.ObjectStorage.Endpoint = "https://account.r2.cloudflarestorage.com"
+		cfg.ObjectStorage.Region = " auto "
+		cfg.ObjectStorage.Bucket = " fibre-shards "
+		cfg.ObjectStorage.Prefix = " /fibre/./ "
+	})
+
+	output := logs.String()
+	require.Contains(t, output, "object_configured=true")
+	require.Contains(t, output, "object_namespace.bucket=fibre-shards")
+	require.Contains(t, output, "object_namespace.prefix=fibre")
+	require.NotContains(t, output, `object_namespace.bucket=" fibre-shards "`)
+	require.NotContains(t, output, `object_namespace.prefix=" /fibre/./ "`)
+}
+
+func TestServerStartDoesNotLogPartialObjectConfig(t *testing.T) {
+	var logs synchronizedLogBuffer
+	makeTestServerWithConfig(t, func(cfg *fibre.ServerConfig) {
+		cfg.Log = slog.New(slog.NewTextHandler(&logs, nil))
+		cfg.ObjectStorage.Endpoint = "https://account.r2.cloudflarestorage.com"
+		cfg.ObjectStorage.Bucket = "fibre-shards"
+		cfg.ObjectStorage.Prefix = "fibre"
+	})
+
+	output := logs.String()
+	require.Contains(t, output, "object_configured=false")
+	require.Contains(t, output, `msg="object storage configuration is invalid"`)
+	require.Contains(t, output, "object_storage.region is required")
+	require.NotContains(t, output, "object_namespace")
+}
+
+func TestServerStartDoesNotLogObjectNamespaceForLocalStorage(t *testing.T) {
+	var logs synchronizedLogBuffer
+	makeTestServerWithConfig(t, func(cfg *fibre.ServerConfig) {
+		cfg.Log = slog.New(slog.NewTextHandler(&logs, nil))
+	})
+
+	output := logs.String()
+	require.Contains(t, output, `msg="store ready" storage_backend=local object_configured=false object_markers_present=false`)
+	require.NotContains(t, output, "object storage configuration is invalid")
+	require.NotContains(t, output, "object_namespace")
+}
+
+// synchronizedLogBuffer allows assertions while background health checks log.
+type synchronizedLogBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *synchronizedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(p)
+}
+
+func (b *synchronizedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}

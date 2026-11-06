@@ -1,0 +1,52 @@
+package types
+
+import (
+	"cosmossdk.io/errors"
+	"github.com/bcp-innovations/hyperlane-cosmos/util"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+)
+
+const URLMsgForward = "/celestia.forwarding.v1.MsgForward"
+
+var (
+	_ sdk.Msg              = &MsgForward{}
+	_ sdk.HasValidateBasic = &MsgForward{}
+)
+
+// NewMsgForward creates a new MsgForward message for triggering token forwarding
+// from a derived forwarding address to its committed destination via Hyperlane.
+func NewMsgForward(signer, forwardAddr string, destDomain uint32, destRecipient, tokenID string, maxIgpFee sdk.Coin) *MsgForward {
+	return &MsgForward{
+		Signer:        signer,
+		ForwardAddr:   forwardAddr,
+		DestDomain:    destDomain,
+		DestRecipient: destRecipient,
+		MaxIgpFee:     maxIgpFee,
+		TokenId:       tokenID,
+	}
+}
+
+func (msg *MsgForward) ValidateBasic() error {
+	if _, err := sdk.AccAddressFromBech32(msg.Signer); err != nil {
+		return errors.Wrap(err, "invalid signer address")
+	}
+
+	if _, err := sdk.AccAddressFromBech32(msg.ForwardAddr); err != nil {
+		return errors.Wrap(err, "invalid forward address")
+	}
+
+	if _, err := util.DecodeHexAddress(msg.DestRecipient); err != nil {
+		return errors.Wrap(err, "invalid dest_recipient hex format")
+	}
+
+	if _, err := util.DecodeHexAddress(msg.TokenId); err != nil {
+		return errors.Wrap(err, "invalid token_id hex format")
+	}
+
+	// Validate max_igp_fee: must be valid and non-negative
+	if err := msg.MaxIgpFee.Validate(); err != nil {
+		return errors.Wrap(err, "invalid max_igp_fee")
+	}
+
+	return nil
+}

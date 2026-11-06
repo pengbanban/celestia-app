@@ -1,0 +1,199 @@
+package keeper
+
+import (
+	"context"
+	"fmt"
+
+	"cosmossdk.io/math"
+	"github.com/bcp-innovations/hyperlane-cosmos/util"
+	warptypes "github.com/bcp-innovations/hyperlane-cosmos/x/warp/types"
+	"github.com/celestiaorg/celestia-app/v11/x/forwarding/types"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+)
+
+var _ types.MsgServer = msgServer{}
+
+type msgServer struct {
+	k Keeper
+}
+
+func NewMsgServerImpl(keeper Keeper) types.MsgServer {
+	return &msgServer{k: keeper}
+}
+
+// Forward forwards the token bound to forwardAddr to the committed destination.
+func (m msgServer) Forward(goCtx context.Context, msg *types.MsgForward) (*types.MsgForwardResponse, error) {
+	ctx := sdk.UnwrapSDKContext(goCtx)
+
+	forwardAddr, err := sdk.AccAddressFromBech32(msg.ForwardAddr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid forward_addr %q: %w", msg.ForwardAddr, err)
+	}
+
+	destRecipient, err := util.DecodeHexAddress(msg.DestRecipient)
+	if err != nil {
+		return nil, fmt.Errorf("invalid dest_recipient hex: %w", err)
+	}
+
+	tokenID, err := util.DecodeHexAddress(msg.TokenId)
+	if err != nil {
+		return nil, fmt.Errorf("invalid token_id hex: %w", err)
+	}
+
+	// Optional custom post-dispatch hook (e.g. an alternative IGP). Empty or the zero
+	// address => mailbox default hook. Decoded before the derivation below because the
+	// address commits to it. The hook only steers which hook is paid for delivery; it
+	// cannot change where the tokens land (still destRecipient).
+	var customHookId *util.HexAddress
+	if msg.CustomHookId != "" {
+		h, err := util.DecodeHexAddress(msg.CustomHookId)
+		if err != nil {
+			return nil, fmt.Errorf("invalid custom_hook_id hex: %w", err)
+		}
+		// Leave nil for the zero address so the quote and dispatch paths agree:
+		// QuoteDispatch substitutes the default hook on IsZeroAddress, but
+		// DispatchMessage only does so on a nil pointer, so a non-nil zero would be
+		// quoted against the default hook yet revert at dispatch.
+		if !h.IsZeroAddress() {
+			customHookId = &h
+		}
+	}
+
+	// Committed alongside the hook, as decoded bytes, so equivalent hex encodings agree.
+	var customHookMetadata []byte
+	if msg.CustomHookMetadata != "" {
+		customHookMetadata, err = util.DecodeEthHex(msg.CustomHookMetadata)
+		if err != nil {
+			return nil, fmt.Errorf("invalid custom_hook_metadata hex: %w", err)
+		}
+	}
+
+	// A forward carrying either field must target an address derived with that exact pair,
+	// so a caller cannot substitute one on someone else's deposit.
+	var hookBytes []byte
+	if customHookId != nil {
+		hookBytes = customHookId.Bytes()
+	}
+	expectedAddr, err := types.DeriveForwardingAddress(msg.DestDomain, destRecipient.Bytes(), tokenID.Bytes(), hookBytes, customHookMetadata)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive forwarding address: %w", err)
+	}
+	if !forwardAddr.Equals(sdk.AccAddress(expectedAddr)) {
+		return nil, fmt.Errorf("%w: provided=%s derived=%s", types.ErrAddressMismatch, forwardAddr.String(), sdk.AccAddress(expectedAddr).String())
+	}
+
+	signerAddr, err := sdk.AccAddressFromBech32(msg.Signer)
+	if err != nil {
+		return nil, fmt.Errorf("invalid signer address: %w", err)
+	}
+
+	hypToken, err := m.k.warpKeeper.GetHypToken(ctx, tokenID.GetInternalId())
+	if err != nil {
+		return nil, fmt.Errorf("token %s not found: %w", msg.TokenId, err)
+	}
+
+	denom, err := m.k.BankDenomForToken(hypToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve token denom: %w", err)
+	}
+
+	// Use the spendable balance so that only transferable coins are forwarded.
+	balance := m.k.bankKeeper.SpendableCoin(ctx, forwardAddr, denom)
+	if !balance.IsPositive() {
+		return nil, types.ErrNoBalance
+	}
+
+	messageID, err := m.forwardToken(ctx, forwardAddr, signerAddr, hypToken, balance, msg.DestDomain, destRecipient, msg.MaxIgpFee, customHookId, customHookMetadata)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s:%s (%s)", types.ErrForwardFailed, balance.Denom, balance.Amount.String(), err)
+	}
+
+	EmitTokenForwardedEvent(ctx, msg.ForwardAddr, msg.TokenId, balance.Denom, messageID.String(), balance.Amount)
+
+	return &types.MsgForwardResponse{
+		Denom:     balance.Denom,
+		Amount:    balance.Amount,
+		MessageId: messageID.String(),
+	}, nil
+}
+
+func (m msgServer) forwardToken(
+	ctx sdk.Context,
+	forwardAddr, signerAddr sdk.AccAddress,
+	hypToken warptypes.HypToken,
+	balance sdk.Coin,
+	destDomain uint32,
+	destRecipient util.HexAddress,
+	maxIgpFee sdk.Coin,
+	customHookId *util.HexAddress,
+	customHookMetadata []byte,
+) (util.HexAddress, error) {
+	hasRoute, err := m.k.HasEnrolledRouter(ctx, hypToken.Id, destDomain)
+	if err != nil {
+		return util.HexAddress{}, fmt.Errorf("error checking warp route: %w", err)
+	}
+	if !hasRoute {
+		return util.HexAddress{}, types.ErrNoWarpRoute
+	}
+
+	// Quote IGP fee for this token transfer, against the same hook and metadata that
+	// will be charged, so the max_igp_fee check below reflects the actual cost.
+	quotedFee, err := m.k.QuoteIgpFeeForToken(ctx, hypToken, destDomain, customHookId, customHookMetadata)
+	if err != nil {
+		return util.HexAddress{}, fmt.Errorf("failed to quote IGP fee: %w", err)
+	}
+
+	// Verify relayer provided sufficient max_igp_fee
+	// Only compare if quoted fee is positive and same denom
+	if quotedFee.IsPositive() {
+		if maxIgpFee.Denom != quotedFee.Denom {
+			return util.HexAddress{}, fmt.Errorf("max_igp_fee denom mismatch: provided %s, required %s", maxIgpFee.Denom, quotedFee.Denom)
+		}
+		if maxIgpFee.Amount.LT(quotedFee.Amount) {
+			return util.HexAddress{}, fmt.Errorf("%w: provided %s, required %s", types.ErrInsufficientIgpFee, maxIgpFee, quotedFee)
+		}
+	}
+
+	// Capture IGP fee denom balance at forwardAddr before sending IGP fee
+	// This allows us to track how much IGP fee was added and handle refunds
+	feeDenomBalance := m.k.bankKeeper.GetBalance(ctx, forwardAddr, quotedFee.Denom)
+
+	// Send IGP fee from relayer (signer) directly to forwardAddr
+	// If this fails, no state has changed - safe to return failure
+	if quotedFee.IsPositive() {
+		if err := m.k.bankKeeper.SendCoins(ctx, signerAddr, forwardAddr, sdk.NewCoins(quotedFee)); err != nil {
+			return util.HexAddress{}, fmt.Errorf("failed to collect IGP fee from relayer: %w", err)
+		}
+	}
+
+	// Execute warp transfer with forwardAddr as sender. If this returns an error,
+	// Forward propagates it and the enclosing tx rollback discards these state changes.
+	messageId, err := m.k.ExecuteWarpTransfer(ctx, hypToken, forwardAddr.String(), destDomain, destRecipient, balance.Amount, quotedFee, customHookId, customHookMetadata)
+	if err != nil {
+		return util.HexAddress{}, fmt.Errorf("warp transfer failed: %w", err)
+	}
+
+	// Warp succeeded - refund any excess IGP fee to the relayer.
+	if quotedFee.IsPositive() {
+		feeDenomBalanceAfter := m.k.bankKeeper.GetBalance(ctx, forwardAddr, quotedFee.Denom)
+		excess := calculateExcessIGPFee(feeDenomBalance, feeDenomBalanceAfter, quotedFee, balance)
+
+		if excess.IsPositive() {
+			excessCoin := sdk.NewCoin(quotedFee.Denom, excess)
+			if err := m.k.bankKeeper.SendCoins(ctx, forwardAddr, signerAddr, sdk.NewCoins(excessCoin)); err != nil {
+				return util.HexAddress{}, fmt.Errorf("failed to refund excess IGP fee to relayer: %w", err)
+			}
+		}
+	}
+
+	return messageId, nil
+}
+
+func calculateExcessIGPFee(before, after, quotedFee, forwardedBalance sdk.Coin) math.Int {
+	igpUsed := before.Amount.Add(quotedFee.Amount).Sub(after.Amount)
+	if forwardedBalance.Denom == quotedFee.Denom {
+		igpUsed = igpUsed.Sub(forwardedBalance.Amount)
+	}
+
+	return quotedFee.Amount.Sub(igpUsed)
+}

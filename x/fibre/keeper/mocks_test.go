@@ -1,0 +1,75 @@
+package keeper_test
+
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+
+	"github.com/cometbft/cometbft/crypto/ed25519"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
+)
+
+// MockBankKeeper implements the expected BankKeeper interface for testing
+type MockBankKeeper struct {
+	SendCoinsFromAccountToModuleFn func(ctx context.Context, senderAddr sdk.AccAddress, recipientModule string, amt sdk.Coins) error
+	SendCoinsFromModuleToAccountFn func(ctx context.Context, senderModule string, recipientAddr sdk.AccAddress, amt sdk.Coins) error
+	SendCoinsFromModuleToModuleFn  func(ctx context.Context, senderModule, recipientModule string, amt sdk.Coins) error
+}
+
+func (m *MockBankKeeper) SendCoinsFromAccountToModule(ctx context.Context, senderAddr sdk.AccAddress, recipientModule string, amt sdk.Coins) error {
+	if m.SendCoinsFromAccountToModuleFn != nil {
+		return m.SendCoinsFromAccountToModuleFn(ctx, senderAddr, recipientModule, amt)
+	}
+	return nil
+}
+
+func (m *MockBankKeeper) SendCoinsFromModuleToAccount(ctx context.Context, senderModule string, recipientAddr sdk.AccAddress, amt sdk.Coins) error {
+	if m.SendCoinsFromModuleToAccountFn != nil {
+		return m.SendCoinsFromModuleToAccountFn(ctx, senderModule, recipientAddr, amt)
+	}
+	return nil
+}
+
+func (m *MockBankKeeper) SendCoinsFromModuleToModule(ctx context.Context, senderModule, recipientModule string, amt sdk.Coins) error {
+	if m.SendCoinsFromModuleToModuleFn != nil {
+		return m.SendCoinsFromModuleToModuleFn(ctx, senderModule, recipientModule, amt)
+	}
+	return nil
+}
+
+// MockStakingKeeper implements the expected StakingKeeper interface for testing
+type MockStakingKeeper struct {
+	GetHistoricalInfoFn func(ctx context.Context, height int64) (stakingtypes.HistoricalInfo, error)
+	historicalInfo      map[int64]stakingtypes.HistoricalInfo
+	validatorKeys       map[int64]ed25519.PrivKey
+	// getCalls counts GetHistoricalInfo calls, the ones that decode.
+	getCalls atomic.Int64
+}
+
+func (m *MockStakingKeeper) GetHistoricalInfo(ctx context.Context, height int64) (stakingtypes.HistoricalInfo, error) {
+	m.getCalls.Add(1)
+	return m.lookup(ctx, height)
+}
+
+func (m *MockStakingKeeper) lookup(ctx context.Context, height int64) (stakingtypes.HistoricalInfo, error) {
+	if m.GetHistoricalInfoFn != nil {
+		return m.GetHistoricalInfoFn(ctx, height)
+	}
+	if m.historicalInfo != nil {
+		if info, ok := m.historicalInfo[height]; ok {
+			return info, nil
+		}
+	}
+	return stakingtypes.HistoricalInfo{}, nil
+}
+
+// HasHistoricalInfo derives from GetHistoricalInfo, so a test that fakes a
+// missing height through GetHistoricalInfoFn covers both.
+func (m *MockStakingKeeper) HasHistoricalInfo(ctx context.Context, height int64) (bool, error) {
+	_, err := m.lookup(ctx, height)
+	if errors.Is(err, stakingtypes.ErrNoHistoricalInfo) {
+		return false, nil
+	}
+	return err == nil, err
+}

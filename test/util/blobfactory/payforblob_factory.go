@@ -1,0 +1,368 @@
+package blobfactory
+
+import (
+	"bytes"
+	"context"
+	"math/rand"
+	"testing"
+	"time"
+
+	"github.com/celestiaorg/celestia-app/v11/app/encoding"
+	"github.com/celestiaorg/celestia-app/v11/pkg/appconsts"
+	"github.com/celestiaorg/celestia-app/v11/pkg/user"
+	"github.com/celestiaorg/celestia-app/v11/test/util/random"
+	"github.com/celestiaorg/celestia-app/v11/test/util/testfactory"
+	blobtypes "github.com/celestiaorg/celestia-app/v11/x/blob/types"
+	fibretypes "github.com/celestiaorg/celestia-app/v11/x/fibre/types"
+	"github.com/celestiaorg/go-square/v4/share"
+	"github.com/celestiaorg/go-square/v4/tx"
+	coretypes "github.com/cometbft/cometbft/types"
+	"github.com/cosmos/cosmos-sdk/client"
+	"github.com/cosmos/cosmos-sdk/crypto/keyring"
+	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+)
+
+var (
+	// TestMaxBlobSize is the maximum size of each blob in a blob transaction, for testing purposes
+	TestMaxBlobSize = share.ShareSize * 2 * appconsts.SquareSizeUpperBound
+	// TestMaxBlobCount is the maximum number of blobs in a blob transaction, for testing purposes
+	TestMaxBlobCount = 5
+)
+
+func RandMsgPayForBlobsWithSigner(rand *rand.Rand, signer string, size, blobCount int) (*blobtypes.MsgPayForBlobs, []*share.Blob) {
+	blobs := RandV0Blobs(rand, size, blobCount)
+	msg, err := blobtypes.NewMsgPayForBlobs(signer, appconsts.Version, blobs...)
+	if err != nil {
+		panic(err)
+	}
+	return msg, blobs
+}
+
+// RandV0Blobs returns the blobs of RandMsgPayForBlobsWithSigner without
+// computing the share commitments of the msg.
+func RandV0Blobs(rand *rand.Rand, size, blobCount int) []*share.Blob {
+	blobs := make([]*share.Blob, blobCount)
+	for i := range blobCount {
+		blob, err := blobtypes.NewV0Blob(testfactory.RandomBlobNamespaceWithPRG(rand), random.Bytes(size))
+		if err != nil {
+			panic(err)
+		}
+		blobs[i] = blob
+	}
+	return blobs
+}
+
+func RandV0BlobsWithNamespace(namespaces []share.Namespace, sizes []int) []*share.Blob {
+	blobs := make([]*share.Blob, len(namespaces))
+	var err error
+	for i, ns := range namespaces {
+		blobs[i], err = share.NewV0Blob(ns, random.Bytes(sizes[i]))
+		if err != nil {
+			panic(err)
+		}
+	}
+	return blobs
+}
+
+func RandV1BlobsWithNamespace(namespaces []share.Namespace, sizes []int, signer sdk.AccAddress) []*share.Blob {
+	blobs := make([]*share.Blob, len(namespaces))
+	var err error
+	for i, ns := range namespaces {
+		blobs[i], err = share.NewV1Blob(ns, random.Bytes(sizes[i]), signer)
+		if err != nil {
+			panic(err)
+		}
+	}
+	return blobs
+}
+
+func RandMsgPayForBlobsWithNamespaceAndSigner(signer string, ns share.Namespace, size int) (*blobtypes.MsgPayForBlobs, *share.Blob) {
+	blob, err := blobtypes.NewV0Blob(ns, random.Bytes(size))
+	if err != nil {
+		panic(err)
+	}
+	msg, err := blobtypes.NewMsgPayForBlobs(
+		signer,
+		appconsts.Version,
+		blob,
+	)
+	if err != nil {
+		panic(err)
+	}
+	return msg, blob
+}
+
+// RandBlobTxsWithAccounts will create random blob transactions using the
+// provided configuration. If no grpc connection is provided, then it will not
+// update the account info. One blob transaction is generated per account
+// provided.
+func RandBlobTxsWithAccounts(
+	enc encoding.Config,
+	r *rand.Rand,
+	kr keyring.Keyring,
+	conn *grpc.ClientConn,
+	size int,
+	blobCount int,
+	randSize bool,
+	accounts []string,
+) []coretypes.Tx {
+	if conn == nil {
+		panic("no grpc connection provided")
+	}
+	if size <= 0 {
+		panic("size should be positive")
+	}
+	if blobCount <= 0 {
+		panic("blobCount should be strictly positive")
+	}
+
+	opts := DefaultTxOpts()
+	txs := make([]coretypes.Tx, len(accounts))
+	for i := range accounts {
+		client, err := user.SetupTxClient(context.Background(), kr, conn, enc)
+		if err != nil {
+			panic(err)
+		}
+
+		randomizedSize := size
+		if randSize {
+			randomizedSize = rand.Intn(size)
+			if randomizedSize == 0 {
+				randomizedSize = 1
+			}
+		}
+		randomizedBlobCount := blobCount
+		if randSize {
+			randomizedBlobCount = rand.Intn(blobCount)
+			if randomizedBlobCount == 0 {
+				randomizedBlobCount = 1
+			}
+		}
+
+		blobs := RandV0Blobs(r, randomizedSize, randomizedBlobCount)
+		cTx, _, err := client.Signer().CreatePayForBlobs(accounts[i], blobs, opts...)
+		if err != nil {
+			panic(err)
+		}
+		txs[i] = cTx
+	}
+
+	return txs
+}
+
+func RandBlobTxs(signer *user.Signer, r *rand.Rand, count, blobsPerTx, size int) coretypes.Txs {
+	txs := make([]coretypes.Tx, count)
+	for i := range count {
+		blobs := RandV0Blobs(r, size, blobsPerTx)
+		tx, _, err := signer.CreatePayForBlobs(testfactory.TestAccName, blobs, DefaultTxOpts()...)
+		if err != nil {
+			panic(err)
+		}
+		txs[i] = tx
+	}
+
+	return txs
+}
+
+func ManyRandBlobs(rand *rand.Rand, sizes ...int) []*share.Blob {
+	return ManyBlobs(rand, testfactory.RandomBlobNamespaces(rand, len(sizes)), sizes)
+}
+
+func ManyBlobs(r *rand.Rand, namespaces []share.Namespace, sizes []int) []*share.Blob {
+	blobs := make([]*share.Blob, len(namespaces))
+	for i, ns := range namespaces {
+		blob, err := share.NewBlob(ns, random.BytesR(r, sizes[i]), share.ShareVersionZero, nil)
+		if err != nil {
+			panic(err)
+		}
+		blobs[i] = blob
+	}
+	return blobs
+}
+
+func NestedBlobs(t *testing.T, namespaces []share.Namespace, sizes [][]int) [][]*share.Blob {
+	blobs := make([][]*share.Blob, len(sizes))
+	counter := 0
+	for i, set := range sizes {
+		for _, size := range set {
+			blob, err := blobtypes.NewV0Blob(namespaces[counter], random.Bytes(size))
+			require.NoError(t, err)
+			blobs[i] = append(blobs[i], blob)
+			counter++
+		}
+	}
+	return blobs
+}
+
+func ManyMultiBlobTx(
+	t *testing.T,
+	enc client.TxConfig,
+	kr keyring.Keyring,
+	chainid string,
+	accounts []string,
+	accInfos []AccountInfo,
+	blobs [][]*share.Blob,
+) [][]byte {
+	t.Helper()
+	txs := make([][]byte, len(accounts))
+	for i, acc := range accounts {
+		signer, err := user.NewSigner(kr, enc, chainid, user.NewAccount(acc, accInfos[i].AccountNum, accInfos[i].Sequence))
+		require.NoError(t, err)
+		txs[i], _, err = signer.CreatePayForBlobs(acc, blobs[i], DefaultTxOpts()...)
+		require.NoError(t, err)
+	}
+	return txs
+}
+
+// IndexWrappedTxWithInvalidNamespace returns an index wrapped PFB tx with an
+// invalid namespace and a blob associated with that index wrapped PFB tx.
+func IndexWrappedTxWithInvalidNamespace(
+	t *testing.T,
+	rand *rand.Rand,
+	signer *user.Signer,
+	index uint32,
+) (coretypes.Tx, *share.Blob) {
+	t.Helper()
+	blob := ManyRandBlobs(rand, 100)[0]
+	acc := signer.Accounts()[0]
+	require.NotNil(t, acc)
+	msg, err := blobtypes.NewMsgPayForBlobs(acc.Address().String(), appconsts.Version, blob)
+	require.NoError(t, err)
+	msg.Namespaces[0] = bytes.Repeat([]byte{1}, 33) // invalid namespace
+
+	rawTx, _, err := signer.CreateTx([]sdk.Msg{msg}, DefaultTxOpts()...)
+	require.NoError(t, err)
+
+	require.NoError(t, err)
+
+	cTx, err := coretypes.MarshalIndexWrapper(rawTx, index)
+	require.NoError(t, err)
+
+	return cTx, blob
+}
+
+func RandBlobTxsWithNamespacesAndSigner(
+	signer *user.Signer,
+	namespaces []share.Namespace,
+	sizes []int,
+) []coretypes.Tx {
+	txs := make([]coretypes.Tx, len(namespaces))
+	for i := range namespaces {
+		// take the first account the signer has
+		acc := signer.Accounts()[0]
+		_, b := RandMsgPayForBlobsWithNamespaceAndSigner(acc.Address().String(), namespaces[i], sizes[i])
+		cTx, _, err := signer.CreatePayForBlobs(acc.Name(), []*share.Blob{b}, DefaultTxOpts()...)
+		if err != nil {
+			panic(err)
+		}
+		txs[i] = cTx
+	}
+
+	return txs
+}
+
+func ComplexBlobTxWithOtherMsgs(t *testing.T, r *rand.Rand, signer *user.Signer, msgs ...sdk.Msg) coretypes.Tx {
+	t.Helper()
+	addr := signer.Accounts()[0].Address().String()
+
+	pfb, blobs := RandMsgPayForBlobsWithSigner(r, addr, 100, 1)
+	msgs = append(msgs, pfb)
+
+	rawTx, _, err := signer.CreateTx(msgs, DefaultTxOpts()...)
+	require.NoError(t, err)
+
+	require.NoError(t, err)
+
+	btx, err := tx.MarshalBlobTx(rawTx, blobs...)
+	require.NoError(t, err)
+	return btx
+}
+
+func GenerateRandomBlobCount(rand *rand.Rand) int {
+	v := rand.Intn(TestMaxBlobCount)
+	if v == 0 {
+		v = 1
+	}
+	return v
+}
+
+func GenerateRandomBlobSize(rand *rand.Rand) int {
+	v := rand.Intn(TestMaxBlobSize)
+	if v == 0 {
+		v = 1
+	}
+	return v
+}
+
+// UnsignedBlobTx creates a minimal unsigned BlobTx for testing. The returned
+// bytes contain no SDK tx, only the blob wrapped in the BlobTx wire format.
+func UnsignedBlobTx(t *testing.T) []byte {
+	t.Helper()
+	ns := share.MustNewV0Namespace([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
+	blob, err := share.NewBlob(ns, []byte("test blob"), share.ShareVersionZero, nil)
+	require.NoError(t, err)
+	blobTxBytes, err := tx.MarshalBlobTx(nil, blob)
+	require.NoError(t, err)
+	return blobTxBytes
+}
+
+// UnsignedPayForFibreTx creates a minimal unsigned SDK tx containing
+// MsgPayForFibre for testing.
+func UnsignedPayForFibreTx(t *testing.T, txConfig client.TxConfig) []byte {
+	t.Helper()
+	privKey := secp256k1.GenPrivKey()
+	msg := NewMsgPayForFibre(t, privKey.PubKey().(*secp256k1.PubKey), "test")
+	builder := txConfig.NewTxBuilder()
+	require.NoError(t, builder.SetMsgs(msg))
+	txBytes, err := txConfig.TxEncoder()(builder.GetTx())
+	require.NoError(t, err)
+	return txBytes
+}
+
+// NewMsgPayForFibre creates a MsgPayForFibre with the given public key and
+// chain ID for testing. Uses sensible defaults for all other fields.
+func NewMsgPayForFibre(t *testing.T, pubKey *secp256k1.PubKey, chainID string) *fibretypes.MsgPayForFibre {
+	t.Helper()
+	addr := sdk.AccAddress(pubKey.Address())
+	ns := share.MustNewV0Namespace(bytes.Repeat([]byte{0x01}, share.NamespaceVersionZeroIDSize))
+	return &fibretypes.MsgPayForFibre{
+		Signer: addr.String(),
+		PaymentPromise: fibretypes.PaymentPromise{
+			ChainId:           chainID,
+			Height:            1,
+			Namespace:         ns.Bytes(),
+			BlobSize:          100,
+			BlobVersion:       fibretypes.BlobVersionZero,
+			Commitment:        bytes.Repeat([]byte{0xAB}, share.FibreCommitmentSize),
+			CreationTimestamp: time.Now(),
+			SignerPublicKey:   *pubKey,
+			Signature:         make([]byte, 64),
+		},
+	}
+}
+
+// GenerateRandomBlobSizes returns a slice of random non-zero blob sizes.
+func GenerateRandomBlobSizes(count int, rand *rand.Rand) []int {
+	sizes := make([]int, count)
+	for i := range sizes {
+		sizes[i] = GenerateRandomBlobSize(rand)
+	}
+	return sizes
+}
+
+// RandMultiBlobTxsSameSigner returns a slice of random Blob transactions (consisting of pfbCount number of txs) each with random number of blobs and blob sizes.
+func RandMultiBlobTxsSameSigner(t *testing.T, rand *rand.Rand, signer *user.Signer, pfbCount int) []coretypes.Tx {
+	pfbTxs := make([]coretypes.Tx, pfbCount)
+	var err error
+	for i := range pfbCount {
+		blobsPerPfb := GenerateRandomBlobCount(rand)
+		blobSizes := GenerateRandomBlobSizes(blobsPerPfb, rand)
+		blobs := ManyRandBlobs(rand, blobSizes...)
+		pfbTxs[i], _, err = signer.CreatePayForBlobs(testfactory.TestAccName, blobs)
+		require.NoError(t, err)
+	}
+	return pfbTxs
+}

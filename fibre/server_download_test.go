@@ -1,0 +1,207 @@
+package fibre_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/celestiaorg/celestia-app/v11/fibre"
+	grpcfibre "github.com/celestiaorg/celestia-app/v11/fibre/internal/grpc"
+	"github.com/celestiaorg/celestia-app/v11/pkg/rsema1d/rlc"
+	"github.com/celestiaorg/celestia-app/v11/x/fibre/types"
+	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// TestServerDownloadShard unit tests the [Server.DownloadShard].
+func TestServerDownloadShard(t *testing.T) {
+	tests := []struct {
+		name            string
+		storeBlob       bool // whether to store the blob before download
+		requestModifier func(*types.DownloadShardRequest, fibre.BlobID)
+		check           func(*testing.T, *types.DownloadShardResponse, error)
+	}{
+		{
+			name:            "Success",
+			storeBlob:       true,
+			requestModifier: nil,
+			check: func(t *testing.T, resp *types.DownloadShardResponse, err error) {
+				require.NoError(t, err)
+				require.NotNil(t, resp)
+				require.NotNil(t, resp.Shard)
+				require.NotEmpty(t, resp.Shard.Rows)
+			},
+		},
+		{
+			name:      "NotFound",
+			storeBlob: false, // don't store the blob
+			check: func(t *testing.T, resp *types.DownloadShardResponse, err error) {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "no blob shard found")
+			},
+		},
+		{
+			name:      "InvalidBlobID_WrongLength",
+			storeBlob: false,
+			requestModifier: func(req *types.DownloadShardRequest, _ fibre.BlobID) {
+				req.BlobId = []byte{1, 2, 3} // too short
+			},
+			check: func(t *testing.T, resp *types.DownloadShardResponse, err error) {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "invalid blob ID")
+			},
+		},
+		{
+			name:      "ReturnsRLCs",
+			storeBlob: true,
+			check: func(t *testing.T, resp *types.DownloadShardResponse, err error) {
+				require.NoError(t, err)
+				require.NotNil(t, resp.Shard)
+				require.NotEmpty(t, resp.Shard.Rows)
+				require.NotEmpty(t, resp.Shard.Rlcs,
+					"RLCs should always be returned")
+			},
+		},
+		{
+			name:      "UnsupportedBlobVersion",
+			storeBlob: false,
+			requestModifier: func(req *types.DownloadShardRequest, id fibre.BlobID) {
+				req.BlobId = fibre.NewBlobID(99, id.Commitment()) // unsupported version
+			},
+			check: func(t *testing.T, resp *types.DownloadShardResponse, err error) {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "unsupported blob version")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, _, _ := makeTestServer(t)
+
+			// create a test blob
+			blob := makeTestBlobV0(t, 256)
+			id := blob.ID()
+
+			// optionally store the blob
+			if tt.storeBlob {
+				storeTestShard(t, server, blob)
+			}
+
+			// create download request
+			req := &types.DownloadShardRequest{
+				BlobId: id,
+			}
+
+			// apply request modifier
+			if tt.requestModifier != nil {
+				tt.requestModifier(req, id)
+			}
+
+			resp, err := server.DownloadShard(t.Context(), req)
+			tt.check(t, resp, err)
+		})
+	}
+}
+
+func TestServerBackendGetMetrics(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+	server, _, _ := makeTestServerWithConfig(t, func(cfg *fibre.ServerConfig) {
+		cfg.Meter = provider.Meter("server-test")
+	})
+	blob := makeTestBlobV0(t, 256)
+	storeTestShard(t, server, blob)
+	_, err := server.DownloadShard(t.Context(), &types.DownloadShardRequest{BlobId: blob.ID()})
+	require.NoError(t, err)
+	var data metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &data))
+	for _, scope := range data.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name == "fibre.server.backend.get.duration" {
+				points := m.Data.(metricdata.Histogram[float64]).DataPoints
+				require.Len(t, points, 1)
+				require.Equal(t, uint64(1), points[0].Count)
+				require.Equal(t, attribute.NewSet(attribute.String("backend", "local"), attribute.String("outcome", "success")), points[0].Attributes)
+				return
+			}
+		}
+	}
+	t.Fatal("server did not record backend GET metrics")
+}
+
+// storeTestShard stores a test blob shard in the server's store for download testing.
+func storeTestShard(t *testing.T, server *fibre.Server, blob *fibre.Blob) {
+	t.Helper()
+
+	// create a payment promise
+	keyring := makeTestKeyring(t)
+	key, err := keyring.Key(fibre.DefaultKeyName)
+	require.NoError(t, err)
+	pubKey, err := key.GetPubKey()
+	require.NoError(t, err)
+
+	promise := &fibre.PaymentPromise{
+		ChainID:           "celestia",
+		Height:            100,
+		Namespace:         testNamespace,
+		UploadSize:        uint32(blob.UploadSize()),
+		BlobVersion:       uint32(blob.ID().Version()),
+		Commitment:        blob.ID().Commitment(),
+		CreationTimestamp: time.Now(),
+		SignerKey:         pubKey.(*secp256k1.PubKey),
+		Signature:         []byte("test-signature"),
+	}
+
+	// create rows for the shard
+	rows := make([]*types.BlobRow, 0, 3)
+	require.NoError(t, blob.RowProofs([]int{0, 1, 2}, func(index int, row []byte, proof [][]byte) {
+		rows = append(rows, &types.BlobRow{
+			Index: uint32(index),
+			Data:  row,
+			Proof: proof,
+		})
+	}))
+
+	shard := &types.BlobShard{
+		Rows: rows,
+		Rlcs: rlc.Marshal(blob.RLC()),
+	}
+
+	err = server.Store().Put(t.Context(), promise, shard, promise.CreationTimestamp.Add(time.Second))
+	require.NoError(t, err)
+}
+
+// TestDownloadShardOversizedRequestRejected checks that the server rejects a
+// DownloadShard request far larger than a blob ID with a gRPC status before the
+// handler runs, and keeps serving afterwards.
+func TestDownloadShardOversizedRequestRejected(t *testing.T) {
+	validators, privKeys := makeTestValidators(t, 1)
+	valSetGetter := newShufflingValidatorSetGetter(validators, 1)
+	servers, _, addresses := makeTestServers(t, validators, privKeys, fibre.DefaultProtocolParams, valSetGetter, nil)
+	t.Cleanup(func() { _ = servers[0].Stop(context.Background()) })
+
+	newClient := grpcfibre.DefaultNewClientFn(
+		&testHostRegistry{addresses: addresses},
+		func() string { return "celestia" },
+		fibre.DefaultProtocolParams.MaxMessageSize(),
+		nil,
+	)
+	client, err := newClient(t.Context(), validators[0])
+	require.NoError(t, err)
+	defer client.Close()
+
+	_, err = client.DownloadShard(t.Context(), &types.DownloadShardRequest{BlobId: make([]byte, 1<<20)})
+	require.Equal(t, codes.Internal, status.Code(err))
+	require.ErrorContains(t, err, "download request exceeds")
+
+	// A well-formed request still reaches the handler.
+	_, err = client.DownloadShard(t.Context(), &types.DownloadShardRequest{BlobId: makeTestBlobV0(t, 256).ID()})
+	require.Equal(t, codes.NotFound, status.Code(err))
+}

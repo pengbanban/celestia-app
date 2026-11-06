@@ -1,0 +1,1157 @@
+package app_test
+
+import (
+	"bytes"
+	"fmt"
+	"testing"
+	"time"
+
+	sdkmath "cosmossdk.io/math"
+	hyperlanetypes "github.com/bcp-innovations/hyperlane-cosmos/x/core/types"
+	"github.com/celestiaorg/celestia-app/v11/app"
+	"github.com/celestiaorg/celestia-app/v11/app/encoding"
+	apperr "github.com/celestiaorg/celestia-app/v11/app/errors"
+	"github.com/celestiaorg/celestia-app/v11/pkg/appconsts"
+	"github.com/celestiaorg/celestia-app/v11/pkg/user"
+	testutil "github.com/celestiaorg/celestia-app/v11/test/util"
+	"github.com/celestiaorg/celestia-app/v11/test/util/blobfactory"
+	"github.com/celestiaorg/celestia-app/v11/test/util/random"
+	"github.com/celestiaorg/celestia-app/v11/test/util/testfactory"
+	"github.com/celestiaorg/celestia-app/v11/test/util/testnode"
+	blobtypes "github.com/celestiaorg/celestia-app/v11/x/blob/types"
+	fibrekeeper "github.com/celestiaorg/celestia-app/v11/x/fibre/keeper"
+	fibretypes "github.com/celestiaorg/celestia-app/v11/x/fibre/types"
+	zkismtypes "github.com/celestiaorg/celestia-app/v11/x/zkism/types"
+	"github.com/celestiaorg/go-square/v4/share"
+	"github.com/celestiaorg/go-square/v4/tx"
+	abci "github.com/cometbft/cometbft/abci/types"
+	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
+	coretypes "github.com/cometbft/cometbft/types"
+	"github.com/cosmos/cosmos-sdk/client"
+	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
+	"github.com/cosmos/cosmos-sdk/crypto/keyring"
+	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
+	txtypes "github.com/cosmos/cosmos-sdk/types/tx"
+	"github.com/cosmos/cosmos-sdk/types/tx/signing"
+	authsigning "github.com/cosmos/cosmos-sdk/x/auth/signing"
+	vestingtypes "github.com/cosmos/cosmos-sdk/x/auth/vesting/types"
+	"github.com/cosmos/cosmos-sdk/x/authz"
+	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+	icahosttypes "github.com/cosmos/ibc-go/v8/modules/apps/27-interchain-accounts/host/types"
+	icatypes "github.com/cosmos/ibc-go/v8/modules/apps/27-interchain-accounts/types"
+	clienttypes "github.com/cosmos/ibc-go/v8/modules/core/02-client/types"
+	channeltypes "github.com/cosmos/ibc-go/v8/modules/core/04-channel/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// CheckTx must reject work that cannot fit in any proposal before running
+// ValidateBasic (which parses ISM verifying keys) or charging the sender.
+func TestCheckTxZKProofMessageLimit(t *testing.T) {
+	encodingConfig := encoding.MakeConfig(app.ModuleEncodingRegisters...)
+	testApp, _ := testutil.SetupTestAppWithGenesisValSet(app.DefaultConsensusParams(), "a")
+	seedICAHostChannel(t, testApp)
+
+	for _, msg := range []sdk.Msg{
+		&zkismtypes.MsgCreateInterchainSecurityModule{},
+		&zkismtypes.MsgUpdateInterchainSecurityModule{},
+		&zkismtypes.MsgSubmitMessages{},
+	} {
+		for _, count := range []int{appconsts.MaxZKProofMessages, appconsts.MaxZKProofMessages + 1} {
+			msgs := make([]sdk.Msg, count)
+			for i := range msgs {
+				msgs[i] = msg
+			}
+			exec := authz.NewMsgExec(sdk.AccAddress{}, msgs)
+			payload, err := icatypes.SerializeCosmosTx(encodingConfig.Codec, msgs, icaEncoding)
+			require.NoError(t, err)
+			data := icatypes.InterchainAccountPacketData{Type: icatypes.EXECUTE_TX, Data: payload}
+			packet := channeltypes.NewPacket(data.GetBytes(), 1, "icacontroller-test", "channel-0", icatypes.HostPortID, icaChannelID, clienttypes.NewHeight(1, 1000000), 0)
+			recv := channeltypes.NewMsgRecvPacket(packet, []byte("proof"), clienttypes.NewHeight(1, 1), "signer")
+			for name, wrapped := range map[string][]sdk.Msg{"direct": msgs, "authz": {&exec}, "ICA": {recv}} {
+				for _, checkType := range []abci.CheckTxType{abci.CheckTxType_New, abci.CheckTxType_Recheck} {
+					t.Run(fmt.Sprintf("%T/%d/%s/%s", msg, count, name, checkType), func(t *testing.T) {
+						rawTx := newUnsignedMultiMsgTx(t, encodingConfig.TxConfig, wrapped...)
+						resp, err := testApp.CheckTx(&abci.RequestCheckTx{Type: checkType, Tx: rawTx})
+						require.NoError(t, err)
+						if count > appconsts.MaxZKProofMessages {
+							require.Equal(t, apperr.ErrTxExceedsMaxZKProofMessages.ABCICode(), resp.Code, resp.Log)
+						} else {
+							// These unsigned fixtures fail later validation, but exactly
+							// one block's work must pass the admission budget check.
+							require.NotEqual(t, apperr.ErrTxExceedsMaxZKProofMessages.ABCICode(), resp.Code, resp.Log)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+// CheckTx must reject ISM signature work that cannot fit in any proposal before
+// the sender is charged, through every dispatch path. An ICA packet naming a
+// MsgProcessMessage fails closed regardless of its metadata.
+func TestCheckTxISMSignatureLimit(t *testing.T) {
+	encodingConfig := encoding.MakeConfig(app.ModuleEncodingRegisters...)
+	testApp, _ := testutil.SetupTestAppWithGenesisValSet(app.DefaultConsensusParams(), "a")
+	seedICAHostChannel(t, testApp)
+
+	for _, count := range []int{appconsts.MaxISMSignatures, appconsts.MaxISMSignatures + 1} {
+		msg := &hyperlanetypes.MsgProcessMessage{Metadata: ismMetadataHex(count)}
+		exec := authz.NewMsgExec(sdk.AccAddress{}, []sdk.Msg{msg})
+		for name, wrapped := range map[string][]sdk.Msg{"direct": {msg}, "authz": {&exec}} {
+			for _, checkType := range []abci.CheckTxType{abci.CheckTxType_New, abci.CheckTxType_Recheck} {
+				t.Run(fmt.Sprintf("%d/%s/%s", count, name, checkType), func(t *testing.T) {
+					rawTx := newUnsignedMultiMsgTx(t, encodingConfig.TxConfig, wrapped...)
+					resp, err := testApp.CheckTx(&abci.RequestCheckTx{Type: checkType, Tx: rawTx})
+					require.NoError(t, err)
+					if count > appconsts.MaxISMSignatures {
+						require.Equal(t, apperr.ErrTxExceedsMaxISMSignatures.ABCICode(), resp.Code, resp.Log)
+					} else {
+						// These unsigned fixtures fail later validation, but exactly
+						// one block's work must pass the admission budget check.
+						require.NotEqual(t, apperr.ErrTxExceedsMaxISMSignatures.ABCICode(), resp.Code, resp.Log)
+					}
+				})
+			}
+		}
+	}
+
+	payload, err := icatypes.SerializeCosmosTx(encodingConfig.Codec, []sdk.Msg{&hyperlanetypes.MsgProcessMessage{Metadata: "0x"}}, icaEncoding)
+	require.NoError(t, err)
+	data := icatypes.InterchainAccountPacketData{Type: icatypes.EXECUTE_TX, Data: payload}
+	packet := channeltypes.NewPacket(data.GetBytes(), 1, "icacontroller-test", "channel-0", icatypes.HostPortID, icaChannelID, clienttypes.NewHeight(1, 1000000), 0)
+	recv := channeltypes.NewMsgRecvPacket(packet, []byte("proof"), clienttypes.NewHeight(1, 1), "signer")
+	t.Run("ICA fails closed", func(t *testing.T) {
+		rawTx := newUnsignedMultiMsgTx(t, encodingConfig.TxConfig, recv)
+		resp, err := testApp.CheckTx(&abci.RequestCheckTx{Type: abci.CheckTxType_New, Tx: rawTx})
+		require.NoError(t, err)
+		require.Equal(t, apperr.ErrTxExceedsMaxISMSignatures.ABCICode(), resp.Code, resp.Log)
+	})
+}
+
+// CheckTx must reject a tx whose gas limit alone exceeds MaxSDKGas, since no
+// proposal can include it.
+func TestCheckTxSDKGasLimit(t *testing.T) {
+	encodingConfig := encoding.MakeConfig(app.ModuleEncodingRegisters...)
+	testApp, _ := testutil.SetupTestAppWithGenesisValSet(app.DefaultConsensusParams(), "a")
+	addr := testnode.RandomAddress().(sdk.AccAddress)
+	msg := banktypes.NewMsgSend(addr, addr, sdk.NewCoins(sdk.NewInt64Coin(appconsts.BondDenom, 1)))
+
+	for _, gas := range []uint64{appconsts.MaxSDKGas, appconsts.MaxSDKGas + 1} {
+		for _, checkType := range []abci.CheckTxType{abci.CheckTxType_New, abci.CheckTxType_Recheck} {
+			t.Run(fmt.Sprintf("%d/%s", gas, checkType), func(t *testing.T) {
+				builder := encodingConfig.TxConfig.NewTxBuilder()
+				require.NoError(t, builder.SetMsgs(msg))
+				builder.SetGasLimit(gas)
+				rawTx, err := encodingConfig.TxConfig.TxEncoder()(builder.GetTx())
+				require.NoError(t, err)
+
+				resp, err := testApp.CheckTx(&abci.RequestCheckTx{Type: checkType, Tx: rawTx})
+				require.NoError(t, err)
+				if gas > appconsts.MaxSDKGas {
+					require.Equal(t, apperr.ErrTxExceedsMaxSDKGas.ABCICode(), resp.Code, resp.Log)
+				} else {
+					// This unsigned fixture fails later validation, but a tx
+					// declaring exactly one block's gas must pass the budget check.
+					require.NotEqual(t, apperr.ErrTxExceedsMaxSDKGas.ABCICode(), resp.Code, resp.Log)
+				}
+			})
+		}
+	}
+}
+
+// TestCheckTxICAPacketWithinLimit checks that CheckTx counts an ICA packet's
+// payload rather than falling back to the fail-closed count. Both paths reject a
+// packet over the limit with the same code, so only a packet under the limit
+// tells them apart: counted it passes the limit check, while a count that failed
+// closed would exceed it.
+func TestCheckTxICAPacketWithinLimit(t *testing.T) {
+	encodingConfig := encoding.MakeConfig(app.ModuleEncodingRegisters...)
+	accounts := []string{"a"}
+	testApp, kr := testutil.SetupTestAppWithGenesisValSet(app.DefaultConsensusParams(), accounts...)
+	seedICAHostChannel(t, testApp)
+
+	fetchedAcc := testutil.DirectQueryAccount(testApp, testfactory.GetAddress(kr, accounts[0]))
+	signer := createSigner(t, kr, accounts[0], encodingConfig.TxConfig, fetchedAcc.GetAccountNumber())
+	addr := signer.Account(accounts[0]).Address()
+
+	msg := icaHostRecvPacket(t, encodingConfig.Codec, addr, appconsts.MaxSDKMessages-1)
+	rawTx, _, err := signer.CreateTx([]sdk.Msg{msg}, user.SetGasLimitAndGasPrice(1e7, appconsts.DefaultMinGasPrice))
+	require.NoError(t, err)
+
+	resp, err := testApp.CheckTx(&abci.RequestCheckTx{Type: abci.CheckTxType_New, Tx: rawTx})
+	require.NoError(t, err)
+	// The packet still fails later in the ante handler, since the test only
+	// seeds the channel, but it must not fail on the message count.
+	require.NotEqual(t, apperr.ErrTxExceedsMaxSDKMessages.ABCICode(), resp.Code, resp.Log)
+}
+
+// Here we only need to check the functionality that is added to CheckTx. We
+// assume that the rest of CheckTx is tested by the cosmos-sdk.
+func TestCheckTx(t *testing.T) {
+	var (
+		err        error
+		resp       *abci.ResponseCheckTx
+		namespace1 share.Namespace
+	)
+
+	encodingConfig := encoding.MakeConfig(app.ModuleEncodingRegisters...)
+	namespace1, err = share.NewV0Namespace(bytes.Repeat([]byte{1}, share.NamespaceVersionZeroIDSize))
+	require.NoError(t, err)
+
+	accounts := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o"}
+	testApp, kr := testutil.SetupTestAppWithGenesisValSet(app.DefaultConsensusParams(), accounts...)
+
+	signers := make([]*user.Signer, len(accounts))
+	for i, account := range accounts {
+		fetchedAcc := testutil.DirectQueryAccount(testApp, testfactory.GetAddress(kr, account))
+		signers[i] = createSigner(t, kr, account, encodingConfig.TxConfig, fetchedAcc.GetAccountNumber())
+	}
+
+	// The message counter reads the payload encoding from the channel, so the
+	// channel the ICA packet below arrives on has to exist.
+	seedICAHostChannel(t, testApp)
+
+	opts := blobfactory.FeeTxOpts(1e9)
+	type test struct {
+		name             string
+		checkType        abci.CheckTxType
+		getTx            func() []byte
+		expectedABCICode uint32
+	}
+
+	tests := []test{
+		{
+			name:      "normal transaction, CheckTxType_New",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				btx := blobfactory.RandBlobTxsWithNamespacesAndSigner(
+					signers[0],
+					[]share.Namespace{namespace1},
+					[]int{100},
+				)[0]
+				return btx
+			},
+			expectedABCICode: abci.CodeTypeOK,
+		},
+		{
+			name:      "normal transaction, CheckTxType_Recheck",
+			checkType: abci.CheckTxType_Recheck,
+			getTx: func() []byte {
+				btx := blobfactory.RandBlobTxsWithNamespacesAndSigner(
+					signers[1],
+					[]share.Namespace{namespace1},
+					[]int{100},
+				)[0]
+				return btx
+			},
+			expectedABCICode: abci.CodeTypeOK,
+		},
+		{
+			name:      "invalid transaction, mismatched namespace",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				btx := blobfactory.RandBlobTxsWithNamespacesAndSigner(
+					signers[2],
+					[]share.Namespace{namespace1},
+					[]int{100},
+				)[0]
+
+				dtx, _, err := tx.UnmarshalBlobTx(btx)
+				require.NoError(t, err)
+				newBlob, err := share.NewBlob(share.RandomBlobNamespace(), dtx.Blobs[0].Data(), appconsts.DefaultShareVersion, nil)
+				require.NoError(t, err)
+				dtx.Blobs[0] = newBlob
+				bbtx, err := tx.MarshalBlobTx(dtx.Tx, dtx.Blobs[0])
+				require.NoError(t, err)
+				return bbtx
+			},
+			expectedABCICode: blobtypes.ErrNamespaceMismatch.ABCICode(),
+		},
+		{
+			name:      "PFB with no blob, CheckTxType_New",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				btx := blobfactory.RandBlobTxsWithNamespacesAndSigner(
+					signers[3],
+					[]share.Namespace{namespace1},
+					[]int{100},
+				)[0]
+				dtx, _ := coretypes.UnmarshalBlobTx(btx)
+				return dtx.Tx
+			},
+			expectedABCICode: blobtypes.ErrNoBlobs.ABCICode(),
+		},
+		{
+			name:      "normal blobTx w/ multiple blobs, CheckTxType_New",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				signer := signers[4]
+				blobs := blobfactory.RandV0Blobs(random.New(), 10_000, 10)
+				tx, _, err := signer.CreatePayForBlobs(accounts[4], blobs, opts...)
+				require.NoError(t, err)
+				return tx
+			},
+			expectedABCICode: abci.CodeTypeOK,
+		},
+		{
+			name:      "1,000 byte blob",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				signer := signers[5]
+				blobs := blobfactory.RandV0Blobs(random.New(), 1_000, 1)
+				tx, _, err := signer.CreatePayForBlobs(accounts[5], blobs, opts...)
+				require.NoError(t, err)
+				return tx
+			},
+			expectedABCICode: abci.CodeTypeOK,
+		},
+		{
+			name:      "10,000 byte blob",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				signer := signers[6]
+				blobs := blobfactory.RandV0Blobs(random.New(), 10_000, 1)
+				tx, _, err := signer.CreatePayForBlobs(accounts[6], blobs, opts...)
+				require.NoError(t, err)
+				return tx
+			},
+			expectedABCICode: abci.CodeTypeOK,
+		},
+		{
+			name:      "100,000 byte blob",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				signer := signers[7]
+				blobs := blobfactory.RandV0Blobs(random.New(), 100_000, 1)
+				tx, _, err := signer.CreatePayForBlobs(accounts[7], blobs, opts...)
+				require.NoError(t, err)
+				return tx
+			},
+			expectedABCICode: abci.CodeTypeOK,
+		},
+		{
+			name:      "1,000,000 byte blob",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				signer := signers[8]
+				blobs := blobfactory.RandV0Blobs(random.New(), 1_000_000, 1)
+				tx, _, err := signer.CreatePayForBlobs(accounts[8], blobs, opts...)
+				require.NoError(t, err)
+				return tx
+			},
+			expectedABCICode: abci.CodeTypeOK,
+		},
+		{
+			name:      "v1 blob with invalid signer",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				signer := signers[10]
+				blob, err := share.NewV1Blob(share.RandomBlobNamespace(), []byte("data"), signer.Account(accounts[10]).Address())
+				require.NoError(t, err)
+				blobTx, _, err := signer.CreatePayForBlobs(accounts[10], []*share.Blob{blob}, opts...)
+				require.NoError(t, err)
+				blob, err = share.NewV1Blob(share.RandomBlobNamespace(), []byte("data"), testnode.RandomAddress().(sdk.AccAddress))
+				require.NoError(t, err)
+				bTx, _, err := tx.UnmarshalBlobTx(blobTx)
+				require.NoError(t, err)
+				bTx.Blobs[0] = blob
+				blobTxBytes, err := tx.MarshalBlobTx(bTx.Tx, bTx.Blobs[0])
+				require.NoError(t, err)
+				return blobTxBytes
+			},
+			expectedABCICode: blobtypes.ErrInvalidBlobSigner.ABCICode(),
+		},
+		{
+			name:      "v1 blob with valid signer",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				signer := signers[10]
+				blob, err := share.NewV1Blob(share.RandomBlobNamespace(), []byte("data"), signer.Account(accounts[10]).Address())
+				require.NoError(t, err)
+				blobTx, _, err := signer.CreatePayForBlobs(accounts[10], []*share.Blob{blob}, opts...)
+				require.NoError(t, err)
+				return blobTx
+			},
+			expectedABCICode: abci.CodeTypeOK,
+		},
+		{
+			name:      "v1 blob over 8MiB",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				signer := signers[11]
+				blob, err := share.NewV1Blob(share.RandomBlobNamespace(), bytes.Repeat([]byte{1}, appconsts.MaxTxSize+1), signer.Account(accounts[11]).Address())
+				require.NoError(t, err)
+				blobTx, _, err := signer.CreatePayForBlobs(accounts[11], []*share.Blob{blob}, opts...)
+				require.NoError(t, err)
+				return blobTx
+			},
+			expectedABCICode: apperr.ErrTxExceedsMaxSize.ABCICode(),
+		},
+		{
+			name:      "v0 blob over 8MiB",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				signer := signers[12]
+				blob, err := share.NewV0Blob(share.RandomBlobNamespace(), bytes.Repeat([]byte{1}, appconsts.MaxTxSize+1))
+				require.NoError(t, err)
+				blobTx, _, err := signer.CreatePayForBlobs(accounts[12], []*share.Blob{blob}, opts...)
+				require.NoError(t, err)
+				return blobTx
+			},
+			expectedABCICode: apperr.ErrTxExceedsMaxSize.ABCICode(),
+		},
+		{
+			// NOTE: this test is in place due to a regression where ledger via amino-json
+			// were not able to submit a MsgCreateVestingAccount transaction.
+			name:      "MsgCreateVestingAccount using amino-json",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				signer := signers[13]
+				msg := &vestingtypes.MsgCreateVestingAccount{
+					FromAddress: signer.Account(accounts[13]).Address().String(),
+					ToAddress:   testutil.AccPubKeys[0].Address().String(),
+					Amount:      sdk.NewCoins(sdk.NewCoin(appconsts.BondDenom, sdkmath.NewInt(1000))),
+					Delayed:     true,
+					EndTime:     time.Now().Add(2 * time.Hour).Unix(),
+					StartTime:   time.Now().Add(1 * time.Hour).Unix(),
+				}
+				tx, _, err := signer.
+					WithSignMode(signing.SignMode_SIGN_MODE_LEGACY_AMINO_JSON).
+					CreateTx([]sdk.Msg{msg}, user.SetGasLimitAndGasPrice(100000, appconsts.DefaultMinGasPrice))
+				require.NoError(t, err)
+				return tx
+			},
+			expectedABCICode: abci.CodeTypeOK,
+		},
+		{
+			name:      "index wrapped PayForFibre tx is rejected",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				rawTx := newUnsignedMultiMsgTx(t, encodingConfig.TxConfig, newMsgPayForFibre(t))
+				wrappedTx, err := coretypes.MarshalIndexWrapper(rawTx, 0)
+				require.NoError(t, err)
+				return wrappedTx
+			},
+			expectedABCICode: apperr.ErrNonPFBIndexWrapper.ABCICode(),
+		},
+		{
+			name:      "index wrapped normal sdk tx is rejected",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				addr := testnode.RandomAddress().(sdk.AccAddress)
+				sendMsg := banktypes.NewMsgSend(addr, addr, sdk.NewCoins(sdk.NewCoin(appconsts.BondDenom, sdkmath.NewInt(1))))
+				rawTx := newUnsignedMultiMsgTx(t, encodingConfig.TxConfig, sendMsg)
+				wrappedTx, err := coretypes.MarshalIndexWrapper(rawTx, 0)
+				require.NoError(t, err)
+				return wrappedTx
+			},
+			expectedABCICode: apperr.ErrNonPFBIndexWrapper.ABCICode(),
+		},
+		{
+			name:      "index wrapped multi msg tx is rejected",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				addr := testnode.RandomAddress().(sdk.AccAddress)
+				sendMsg := banktypes.NewMsgSend(addr, addr, sdk.NewCoins(sdk.NewCoin(appconsts.BondDenom, sdkmath.NewInt(1))))
+				rawTx := newUnsignedMultiMsgTx(t, encodingConfig.TxConfig, sendMsg, sendMsg)
+				wrappedTx, err := coretypes.MarshalIndexWrapper(rawTx, 0)
+				require.NoError(t, err)
+				return wrappedTx
+			},
+			expectedABCICode: apperr.ErrMultiMsgIndexWrapper.ABCICode(),
+		},
+		{
+			name:      "index wrapped PFB tx without blobs is rejected",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				btx := blobfactory.RandBlobTxsWithNamespacesAndSigner(
+					signers[2],
+					[]share.Namespace{namespace1},
+					[]int{100},
+				)[0]
+				dtx, _ := coretypes.UnmarshalBlobTx(btx)
+				wrappedTx, err := coretypes.MarshalIndexWrapper(dtx.Tx, 0)
+				require.NoError(t, err)
+				return wrappedTx
+			},
+			expectedABCICode: blobtypes.ErrNoBlobs.ABCICode(),
+		},
+		{
+			name:      "normal transaction exceeding max SDK messages, CheckTxType_New",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				signer := signers[9]
+				addr := signer.Account(accounts[9]).Address()
+				msgs := make([]sdk.Msg, appconsts.MaxSDKMessages+1)
+				for i := range msgs {
+					msgs[i] = banktypes.NewMsgSend(addr, addr, sdk.NewCoins(sdk.NewCoin(appconsts.BondDenom, sdkmath.NewInt(1))))
+				}
+				tx, _, err := signer.CreateTx(msgs, user.SetGasLimitAndGasPrice(1e6, appconsts.DefaultMinGasPrice))
+				require.NoError(t, err)
+				return tx
+			},
+			expectedABCICode: apperr.ErrTxExceedsMaxSDKMessages.ABCICode(),
+		},
+		{
+			name:      "authz MsgExec flattening exceeding max SDK messages, CheckTxType_New",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				signer := signers[11]
+				addr := signer.Account(accounts[11]).Address()
+				// Spread MaxSDKMessages+1 executable messages across MsgExec
+				// wrappers of at most 99 inner messages each (the tx decoder's
+				// per-message unpack limit). Only the wrappers are top-level
+				// messages, so this must still be rejected.
+				var msgs []sdk.Msg
+				for remaining := appconsts.MaxSDKMessages + 1; remaining > 0; {
+					n := min(99, remaining)
+					inner := make([]sdk.Msg, n)
+					for i := range inner {
+						inner[i] = banktypes.NewMsgSend(addr, addr, sdk.NewCoins(sdk.NewCoin(appconsts.BondDenom, sdkmath.NewInt(1))))
+					}
+					exec := authz.NewMsgExec(addr, inner)
+					msgs = append(msgs, &exec)
+					remaining -= n
+				}
+				tx, _, err := signer.CreateTx(msgs, user.SetGasLimitAndGasPrice(1e7, appconsts.DefaultMinGasPrice))
+				require.NoError(t, err)
+				return tx
+			},
+			expectedABCICode: apperr.ErrTxExceedsMaxSDKMessages.ABCICode(),
+		},
+		{
+			name:      "MsgModuleQuerySafe queries exceeding max SDK messages, CheckTxType_New",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				signer := signers[14]
+				addr := signer.Account(accounts[14]).Address()
+				// A single MsgModuleQuerySafe dispatches one query per request, so
+				// counting it as one message would let it bypass the limit.
+				requests := make([]*icahosttypes.QueryRequest, appconsts.MaxSDKMessages+1)
+				for i := range requests {
+					requests[i] = &icahosttypes.QueryRequest{Path: "/cosmos.bank.v1beta1.Query/TotalSupply"}
+				}
+				msg := icahosttypes.NewMsgModuleQuerySafe(addr.String(), requests)
+				tx, _, err := signer.CreateTx([]sdk.Msg{msg}, user.SetGasLimitAndGasPrice(1e7, appconsts.DefaultMinGasPrice))
+				require.NoError(t, err)
+				return tx
+			},
+			expectedABCICode: apperr.ErrTxExceedsMaxSDKMessages.ABCICode(),
+		},
+		{
+			name:      "ICA packet flattening exceeding max SDK messages, CheckTxType_New",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				signer := signers[14]
+				addr := signer.Account(accounts[14]).Address()
+				// The ICA host dispatches every message in the packet payload,
+				// but only the packet is a top-level message, so this must still
+				// be rejected. The packet itself counts as one.
+				msg := icaHostRecvPacket(t, encodingConfig.Codec, addr, appconsts.MaxSDKMessages)
+				tx, _, err := signer.CreateTx([]sdk.Msg{msg}, user.SetGasLimitAndGasPrice(1e7, appconsts.DefaultMinGasPrice))
+				require.NoError(t, err)
+				return tx
+			},
+			expectedABCICode: apperr.ErrTxExceedsMaxSDKMessages.ABCICode(),
+		},
+		{
+			name:      "non-canonically encoded blob tx, CheckTxType_New",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				btx := blobfactory.RandBlobTxsWithNamespacesAndSigner(
+					signers[10],
+					[]share.Namespace{namespace1},
+					[]int{100},
+				)[0]
+				// Append an unknown protobuf field so UnmarshalBlobTx rejects it.
+				return appendUnknownProtoField(btx, 4096)
+			},
+			expectedABCICode: apperr.ErrNonCanonicalBlobTx.ABCICode(),
+		},
+		{
+			name:      "blob tx with repeated singular protobuf field, CheckTxType_New",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				btx := blobfactory.RandBlobTxsWithNamespacesAndSigner(
+					signers[10],
+					[]share.Namespace{namespace1},
+					[]int{100},
+				)[0]
+				// Repeat the singular type_id field (field 3, wire type 2,
+				// value "BLOB"). proto.Unmarshal keeps the last value so it
+				// decodes to the same blob tx, but the encoding is not
+				// canonical, so CheckTx must reject it.
+				return append(btx, 0x1a, 0x04, 'B', 'L', 'O', 'B')
+			},
+			expectedABCICode: apperr.ErrNonCanonicalBlobTx.ABCICode(),
+		},
+		{
+			name:      "nested blob tx, CheckTxType_New",
+			checkType: abci.CheckTxType_New,
+			getTx: func() []byte {
+				inner := blobfactory.RandBlobTxsWithNamespacesAndSigner(
+					signers[10],
+					[]share.Namespace{namespace1},
+					[]int{100},
+				)[0]
+				innerBlobTx, isBlob, err := tx.UnmarshalBlobTx(inner)
+				require.NoError(t, err)
+				require.True(t, isBlob)
+				outer, err := tx.MarshalBlobTx(inner, innerBlobTx.Blobs...)
+				require.NoError(t, err)
+				return outer
+			},
+			expectedABCICode: apperr.ErrNonCanonicalBlobTx.ABCICode(),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			txBz := tt.getTx()
+			resp, err = testApp.CheckTx(&abci.RequestCheckTx{Type: tt.checkType, Tx: txBz})
+			if resp.Code == 0 {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.expectedABCICode, resp.Code, resp.Log)
+
+			if resp.Code != abci.CodeTypeOK {
+				return
+			}
+
+			var baseTxBz []byte
+			decodedBlobTx, isBlob, err := tx.UnmarshalBlobTx(txBz)
+			if isBlob {
+				require.NoError(t, err)
+				require.NotNil(t, decodedBlobTx)
+				baseTxBz = decodedBlobTx.Tx
+			} else {
+				// Non-blob transactions can surface decoding errors (e.g. invalid UTF-8 inside signatures)
+				// which we can safely ignore since we only need the raw tx bytes for non-blob txs.
+				baseTxBz = txBz
+			}
+
+			sdkTx, err := encodingConfig.TxConfig.TxDecoder()(baseTxBz)
+			require.NoError(t, err)
+
+			sigTx, ok := sdkTx.(authsigning.SigVerifiableTx)
+			require.True(t, ok, "tx must implement SigVerifiableTx")
+
+			sigs, err := sigTx.GetSignaturesV2()
+			require.NoError(t, err)
+			require.NotEmpty(t, sigs)
+
+			require.Equal(t, sigs[0].PubKey.Address().Bytes(), resp.Address)
+			require.Equal(t, sigs[0].Sequence, resp.Sequence)
+		})
+	}
+}
+
+// TestCheckTx_UnknownRequestType verifies that an unknown CheckTxType returns
+// an error response instead of panicking.
+func TestCheckTx_UnknownRequestType(t *testing.T) {
+	encodingConfig := encoding.MakeConfig(app.ModuleEncodingRegisters...)
+	namespace1, err := share.NewV0Namespace(bytes.Repeat([]byte{1}, share.NamespaceVersionZeroIDSize))
+	require.NoError(t, err)
+
+	accounts := []string{"a"}
+	testApp, kr := testutil.SetupTestAppWithGenesisValSet(app.DefaultConsensusParams(), accounts...)
+	fetchedAcc := testutil.DirectQueryAccount(testApp, testfactory.GetAddress(kr, "a"))
+	signer := createSigner(t, kr, "a", encodingConfig.TxConfig, fetchedAcc.GetAccountNumber())
+
+	// Create a valid blob transaction.
+	blobTxBytes := blobfactory.RandBlobTxsWithNamespacesAndSigner(
+		signer,
+		[]share.Namespace{namespace1},
+		[]int{100},
+	)[0]
+
+	unknownCheckTxTypes := []abci.CheckTxType{2, 99, -1}
+	for _, unknownType := range unknownCheckTxTypes {
+		t.Run(unknownType.String(), func(t *testing.T) {
+			assert.NotPanics(t, func() {
+				resp, err := testApp.CheckTx(&abci.RequestCheckTx{
+					Type: unknownType,
+					Tx:   blobTxBytes,
+				})
+				require.Error(t, err)
+				assert.NotEqual(t, abci.CodeTypeOK, resp.Code)
+				assert.Contains(t, resp.Log, "unknown RequestCheckTx type")
+			})
+		})
+	}
+}
+
+// TestCheckTxMalformedModeInfoDoesNotPanic verifies that a tx with a SignerInfo
+// whose ModeInfo oneof is unset is rejected without panicking. Such a ModeInfo
+// decodes cleanly but makes GetSignaturesV2 panic.
+func TestCheckTxMalformedModeInfoDoesNotPanic(t *testing.T) {
+	accounts := []string{"a"}
+	testApp, _ := testutil.SetupTestAppWithGenesisValSet(app.DefaultConsensusParams(), accounts...)
+
+	addr := testnode.RandomAddress().(sdk.AccAddress)
+	sendMsg := banktypes.NewMsgSend(addr, addr, sdk.NewCoins(sdk.NewCoin(appconsts.BondDenom, sdkmath.NewInt(1))))
+	msgAny, err := codectypes.NewAnyWithValue(sendMsg)
+	require.NoError(t, err)
+
+	rawTx := &txtypes.Tx{
+		Body: &txtypes.TxBody{Messages: []*codectypes.Any{msgAny}},
+		AuthInfo: &txtypes.AuthInfo{
+			SignerInfos: []*txtypes.SignerInfo{{
+				ModeInfo: &txtypes.ModeInfo{}, // present but oneof (Sum) unset
+				Sequence: 0,
+			}},
+			Fee: &txtypes.Fee{},
+		},
+		Signatures: [][]byte{{}},
+	}
+	txBz, err := rawTx.Marshal()
+	require.NoError(t, err)
+
+	require.NotPanics(t, func() {
+		resp, _ := testApp.CheckTx(&abci.RequestCheckTx{Type: abci.CheckTxType_New, Tx: txBz})
+		require.NotEqual(t, abci.CodeTypeOK, resp.Code)
+	})
+}
+
+// TestCheckTxBlobTxCacheAdmission verifies that only blob txs passing full
+// CheckTx are admitted to the cache consulted by ProcessProposal.
+func TestCheckTxBlobTxCacheAdmission(t *testing.T) {
+	encodingConfig := encoding.MakeConfig(app.ModuleEncodingRegisters...)
+	accounts := []string{"a"}
+	testApp, kr := testutil.SetupTestAppWithGenesisValSet(app.DefaultConsensusParams(), accounts...)
+
+	fetchedAcc := testutil.DirectQueryAccount(testApp, testfactory.GetAddress(kr, accounts[0]))
+	namespace, err := share.NewV0Namespace(bytes.Repeat([]byte{1}, share.NamespaceVersionZeroIDSize))
+	require.NoError(t, err)
+
+	fromCacheAfterCheckTx := func(rawTx []byte) bool {
+		blobTx, isBlob, err := tx.UnmarshalBlobTx(rawTx)
+		require.True(t, isBlob)
+		require.NoError(t, err)
+		fromCache, err := testApp.ValidateBlobTxWithCache(blobTx)
+		require.NoError(t, err)
+		return fromCache
+	}
+
+	// A blob tx signed with a wrong account number passes stateless blob
+	// validation but fails the stateful ante pass; it must not be cached.
+	badSigner := createSigner(t, kr, accounts[0], encodingConfig.TxConfig, fetchedAcc.GetAccountNumber()+1)
+	invalidTx := blobfactory.RandBlobTxsWithNamespacesAndSigner(badSigner, []share.Namespace{namespace}, []int{100})[0]
+	resp, err := testApp.CheckTx(&abci.RequestCheckTx{Type: abci.CheckTxType_New, Tx: invalidTx})
+	require.NoError(t, err)
+	require.NotEqual(t, abci.CodeTypeOK, resp.Code)
+	assert.False(t, fromCacheAfterCheckTx(invalidTx), "a blob tx failing CheckTx must not be cached")
+
+	signer := createSigner(t, kr, accounts[0], encodingConfig.TxConfig, fetchedAcc.GetAccountNumber())
+	validTx := blobfactory.RandBlobTxsWithNamespacesAndSigner(signer, []share.Namespace{namespace}, []int{100})[0]
+	resp, err = testApp.CheckTx(&abci.RequestCheckTx{Type: abci.CheckTxType_New, Tx: validTx})
+	require.NoError(t, err)
+	require.Equal(t, abci.CodeTypeOK, resp.Code, resp.Log)
+	assert.True(t, fromCacheAfterCheckTx(validTx), "a blob tx passing CheckTx must be cached")
+}
+
+// TestBlobTxCacheAcrossABCIPhases checks that a blob tx cached by CheckTx gets
+// the same proposal validity, gas and state as an uncached one, and that a
+// committed tx is still rejected while it remains cached.
+func TestBlobTxCacheAcrossABCIPhases(t *testing.T) {
+	enc := encoding.MakeConfig(app.ModuleEncodingRegisters...)
+	accounts := testfactory.GenerateAccounts(2)
+	testApp, kr := testutil.SetupTestAppWithGenesisValSet(app.DefaultConsensusParams(), accounts...)
+	newSigner := newSignerFactory(t, kr, enc.TxConfig, accounts, queryAccountInfo(testApp, accounts, kr))
+	coldAddr, warmAddr := testfactory.GetAddress(kr, accounts[0]), testfactory.GetAddress(kr, accounts[1])
+
+	ns := share.MustNewV0Namespace(bytes.Repeat([]byte{1}, share.NamespaceVersionZeroIDSize))
+	coldTx := blobfactory.RandBlobTxsWithNamespacesAndSigner(newSigner(0), []share.Namespace{ns}, []int{100})[0]
+	warmTx := blobfactory.RandBlobTxsWithNamespacesAndSigner(newSigner(1), []share.Namespace{ns}, []int{100})[0]
+	require.Len(t, warmTx, len(coldTx), "equal tx sizes make gas comparable")
+
+	// mutatedTx keeps warmTx's signed tx bytes but swaps in a same-size blob.
+	warmBlobTx, _, err := tx.UnmarshalBlobTx(warmTx)
+	require.NoError(t, err)
+	mutatedBlob, err := share.NewV0Blob(ns, bytes.Repeat([]byte{0xFF}, 100))
+	require.NoError(t, err)
+	mutatedTx, err := tx.MarshalBlobTx(warmBlobTx.Tx, mutatedBlob)
+	require.NoError(t, err)
+
+	fromCache := func(rawTx []byte) bool {
+		blobTx, _, err := tx.UnmarshalBlobTx(rawTx)
+		require.NoError(t, err)
+		cached, err := testApp.ValidateBlobTxWithCache(blobTx)
+		require.NoError(t, err)
+		return cached
+	}
+
+	resp, err := testApp.CheckTx(&abci.RequestCheckTx{Type: abci.CheckTxType_New, Tx: warmTx})
+	require.NoError(t, err)
+	require.Equal(t, abci.CodeTypeOK, resp.Code, resp.Log)
+	_, err = testApp.CheckTx(&abci.RequestCheckTx{Type: abci.CheckTxType_New, Tx: mutatedTx})
+	require.ErrorIs(t, err, blobtypes.ErrInvalidShareCommitment)
+	require.True(t, fromCache(warmTx))
+	require.False(t, fromCache(coldTx))
+
+	for _, tc := range []struct {
+		txs  [][]byte
+		want abci.ResponseProcessProposal_ProposalStatus
+	}{
+		{txs: [][]byte{coldTx, warmTx}, want: abci.ResponseProcessProposal_ACCEPT},
+		{txs: [][]byte{coldTx, mutatedTx}, want: abci.ResponseProcessProposal_REJECT},
+	} {
+		res, err := testApp.ProcessProposal(processProposalRequest(t, testApp, tc.txs))
+		require.NoError(t, err)
+		require.Equal(t, tc.want, res.Status)
+	}
+
+	balance := func(addr sdk.AccAddress) sdkmath.Int {
+		ctx := testApp.NewUncachedContext(false, cmtproto.Header{})
+		return testApp.BankKeeper.GetBalance(ctx, addr, appconsts.BondDenom).Amount
+	}
+	coldBefore, warmBefore := balance(coldAddr), balance(warmAddr)
+	// Separate blocks keep each tx first in its block, so gas is comparable.
+	coldRes := commitBlock(t, testApp, coldTx).TxResults
+	warmRes := commitBlock(t, testApp, warmTx).TxResults
+	require.Len(t, coldRes, 1)
+	require.Len(t, warmRes, 1)
+	require.Equal(t, abci.CodeTypeOK, coldRes[0].Code, coldRes[0].Log)
+	require.Equal(t, abci.CodeTypeOK, warmRes[0].Code, warmRes[0].Log)
+	assert.Equal(t, coldRes[0].GasWanted, warmRes[0].GasWanted)
+	assert.Equal(t, coldRes[0].GasUsed, warmRes[0].GasUsed)
+	assert.Equal(t, coldBefore.Sub(balance(coldAddr)), warmBefore.Sub(balance(warmAddr)))
+	assert.Equal(t, uint64(1), testutil.DirectQueryAccount(testApp, coldAddr).GetSequence())
+	assert.Equal(t, uint64(1), testutil.DirectQueryAccount(testApp, warmAddr).GetSequence())
+
+	// The committed tx stays cached, yet every phase rejects its replay.
+	require.True(t, fromCache(warmTx))
+	res, err := testApp.ProcessProposal(processProposalRequest(t, testApp, [][]byte{warmTx}))
+	require.NoError(t, err)
+	assert.Equal(t, abci.ResponseProcessProposal_REJECT, res.Status)
+	for _, checkType := range []abci.CheckTxType{abci.CheckTxType_New, abci.CheckTxType_Recheck} {
+		resp, err := testApp.CheckTx(&abci.RequestCheckTx{Type: checkType, Tx: warmTx})
+		require.NoError(t, err)
+		assert.Equal(t, sdkerrors.ErrWrongSequence.ABCICode(), resp.Code, resp.Log)
+	}
+}
+
+func createSigner(t *testing.T, kr keyring.Keyring, accountName string, enc client.TxConfig, accNum uint64) *user.Signer {
+	t.Helper()
+
+	signer, err := user.NewSigner(kr, enc, testutil.ChainID, user.NewAccount(accountName, accNum, 0))
+	require.NoError(t, err)
+	return signer
+}
+
+// TestCheckTxPayForFibre covers gas, caching, and invalid tx shapes.
+func TestCheckTxPayForFibre(t *testing.T) {
+	enc := encoding.MakeConfig(app.ModuleEncodingRegisters...)
+	accounts := testfactory.GenerateAccounts(4)
+	testApp, kr := testutil.SetupTestAppWithGenesisValSet(app.DefaultConsensusParams(), accounts...)
+	commitBlock(t, testApp)
+	infos := queryAccountInfo(testApp, accounts, kr)
+
+	newSigner := newSignerFactory(t, kr, enc.TxConfig, accounts, infos)
+	for _, account := range accounts {
+		seedFibreEscrow(t, testApp, testfactory.GetAddress(kr, account), 1_000_000)
+	}
+
+	t.Run("valid tx charges deterministic signature verification gas", func(t *testing.T) {
+		txBytes := newSignedPayForFibreTx(t, newSigner(0), accounts[0], true)
+
+		resp, err := testApp.CheckTx(&abci.RequestCheckTx{Tx: txBytes, Type: abci.CheckTxType_New})
+		require.NoError(t, err)
+		require.Equal(t, abci.CodeTypeOK, resp.Code, resp.Log)
+		require.GreaterOrEqual(t, uint64(resp.GasUsed), fibretypes.EstimateGasForPayForFibreSignatureVerification(1))
+	})
+
+	t.Run("tx with gas limit below the deterministic validation gas is rejected", func(t *testing.T) {
+		gasLimitBelow := fibretypes.EstimateGasForPayForFibreSignatureVerification(1) - 1
+		txBytes := newSignedPayForFibreTxWithOpts(t, newSigner(1), accounts[1], true,
+			user.SetGasLimit(gasLimitBelow), user.SetFee(4_000))
+
+		resp, err := testApp.CheckTx(&abci.RequestCheckTx{Tx: txBytes, Type: abci.CheckTxType_New})
+		require.NoError(t, err)
+		require.NotEqual(t, abci.CodeTypeOK, resp.Code)
+		require.Contains(t, resp.Log, "out of gas")
+	})
+
+	t.Run("resubmitting a tx with invalid validator signatures is rejected again", func(t *testing.T) {
+		// Failed verifications must not be cached.
+		txBytes := newSignedPayForFibreTx(t, newSigner(3), accounts[3], false)
+
+		first, err := testApp.CheckTx(&abci.RequestCheckTx{Tx: txBytes, Type: abci.CheckTxType_New})
+		require.NoError(t, err)
+		require.NotEqual(t, abci.CodeTypeOK, first.Code)
+		require.Contains(t, first.Log, "validator signature validation failed")
+
+		second, err := testApp.CheckTx(&abci.RequestCheckTx{Tx: txBytes, Type: abci.CheckTxType_New})
+		require.NoError(t, err)
+		require.NotEqual(t, abci.CodeTypeOK, second.Code)
+		require.Equal(t, first.Code, second.Code)
+		require.Contains(t, second.Log, "validator signature validation failed")
+	})
+
+	t.Run("tx mixing MsgPayForFibre with other messages is rejected", func(t *testing.T) {
+		signer := newSigner(2)
+		acc := signer.Account(accounts[2])
+		addr := testfactory.GetAddress(kr, accounts[2])
+		pff := blobfactory.NewMsgPayForFibre(t, acc.PubKey().(*secp256k1.PubKey), testutil.ChainID)
+		send := banktypes.NewMsgSend(addr, addr, sdk.NewCoins(sdk.NewInt64Coin(appconsts.BondDenom, 1)))
+		txBytes, _, err := signer.CreateTx([]sdk.Msg{pff, send}, user.SetGasLimit(1_000_000), user.SetFee(4_000))
+		require.NoError(t, err)
+
+		resp, err := testApp.CheckTx(&abci.RequestCheckTx{Tx: txBytes, Type: abci.CheckTxType_New})
+		require.NoError(t, err)
+		require.Equal(t, apperr.ErrInvalidPayForFibreTx.ABCICode(), resp.Code)
+	})
+}
+
+// TestCheckTxPayForFibreVerifiesSignaturesOnlyAfterAdmission covers the ante
+// ordering the pre-pass depends on: the fibre signature decorator runs behind
+// every decorator that rejects a transaction more cheaply, so a tx rejected for
+// gas, fees or admission is never charged for its signature work.
+func TestCheckTxPayForFibreVerifiesSignaturesOnlyAfterAdmission(t *testing.T) {
+	enc := encoding.MakeConfig(app.ModuleEncodingRegisters...)
+	accounts := testfactory.GenerateAccounts(3)
+	testApp, kr := testutil.SetupTestAppWithGenesisValSet(app.DefaultConsensusParams(), accounts...)
+	commitBlock(t, testApp)
+	infos := queryAccountInfo(testApp, accounts, kr)
+	newSigner := newSignerFactory(t, kr, enc.TxConfig, accounts, infos)
+
+	// Gas that covers the signature checks but not the rest of the ante pass,
+	// so the rejection cannot be mistaken for the signature bound.
+	signatureGas := fibretypes.EstimateGasForPayForFibreSignatureVerification(1)
+
+	tests := map[string]struct {
+		account   int
+		escrow    bool
+		opts      []user.TxOption
+		wantAdmit bool
+	}{
+		"no escrow account": {
+			account: 0,
+			escrow:  false,
+			opts:    []user.TxOption{user.SetGasLimit(1_000_000), user.SetFee(4_000)},
+		},
+		"gas above the signature estimate but below the ante total": {
+			account: 1,
+			escrow:  true,
+			opts:    []user.TxOption{user.SetGasLimit(signatureGas + 1), user.SetFee(4_000)},
+		},
+		// The control: an admitted tx does reach the signature checks.
+		"admitted tx": {
+			account:   2,
+			escrow:    true,
+			opts:      []user.TxOption{user.SetGasLimit(1_000_000), user.SetFee(4_000)},
+			wantAdmit: true,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			if tc.escrow {
+				seedFibreEscrow(t, testApp, testfactory.GetAddress(kr, accounts[tc.account]), 1_000_000)
+			}
+			txBytes := newSignedPayForFibreTxWithOpts(t, newSigner(tc.account), accounts[tc.account], true, tc.opts...)
+
+			decoded := fibrekeeper.DecodePayForFibre(txBytes)
+			require.NotNil(t, decoded)
+			require.True(t, decoded.CertKeyed)
+			require.True(t, decoded.PromiseKeyed())
+
+			resp, err := testApp.CheckTx(&abci.RequestCheckTx{Tx: txBytes, Type: abci.CheckTxType_New})
+			require.NoError(t, err)
+			if tc.wantAdmit {
+				require.Equal(t, abci.CodeTypeOK, resp.Code, resp.Log)
+				require.True(t, testApp.HasVerifiedSignature(decoded.CertKey))
+				require.True(t, testApp.HasVerifiedSignature(decoded.PromiseKey))
+				return
+			}
+
+			require.NotEqual(t, abci.CodeTypeOK, resp.Code, resp.Log)
+			require.False(t, testApp.HasVerifiedSignature(decoded.CertKey),
+				"a rejected tx must not have its certificate verified")
+			require.False(t, testApp.HasVerifiedSignature(decoded.PromiseKey),
+				"a rejected tx must not have its promise signature verified")
+		})
+	}
+}
+
+// TestCheckTxPayForFibreRecheck checks that a rechecked payment promise takes the
+// pay-for-fibre shortcut and bytes that are not one take the full path.
+func TestCheckTxPayForFibreRecheck(t *testing.T) {
+	enc := encoding.MakeConfig(app.ModuleEncodingRegisters...)
+	// One account per case: CheckTx bumps the signer's sequence in the check
+	// state, so cases cannot share a signer within a block.
+	accounts := testfactory.GenerateAccounts(3)
+	testApp, kr := testutil.SetupTestAppWithGenesisValSet(app.DefaultConsensusParams(), accounts...)
+	commitBlock(t, testApp)
+	infos := queryAccountInfo(testApp, accounts, kr)
+
+	newSigner := newSignerFactory(t, kr, enc.TxConfig, accounts, infos)
+	for _, account := range accounts {
+		seedFibreEscrow(t, testApp, testfactory.GetAddress(kr, account), 1_000_000)
+	}
+
+	// The shortcut keys on the shape alone, so it also applies to a pay-for-fibre the
+	// node never admitted; the verdict is the same either way.
+	t.Run("a recheck that was never admitted still reaches the same verdict", func(t *testing.T) {
+		txBytes := newSignedPayForFibreTx(t, newSigner(1), accounts[1], true)
+		require.True(t, fibretypes.IsPayForFibreTx(txBytes))
+
+		resp, err := testApp.CheckTx(&abci.RequestCheckTx{Tx: txBytes, Type: abci.CheckTxType_Recheck})
+		require.NoError(t, err)
+		require.Equal(t, abci.CodeTypeOK, resp.Code, resp.Log)
+	})
+
+	// Skipping countExecutableMsgs is sound only for a lone MsgPayForFibre (always 1
+	// against MaxSDKMessages); any other shape takes the full path on every recheck.
+	t.Run("a non PayForFibre tx takes the full path", func(t *testing.T) {
+		addr := testfactory.GetAddress(kr, accounts[2])
+		send := banktypes.NewMsgSend(addr, addr, sdk.NewCoins(sdk.NewInt64Coin(appconsts.BondDenom, 1)))
+		txBytes, _, err := newSigner(2).CreateTx([]sdk.Msg{send}, user.SetGasLimit(200_000), user.SetFee(4_000))
+		require.NoError(t, err)
+		require.False(t, fibretypes.IsPayForFibreTx(txBytes))
+
+		resp, err := testApp.CheckTx(&abci.RequestCheckTx{Tx: txBytes, Type: abci.CheckTxType_New})
+		require.NoError(t, err)
+		require.Equal(t, abci.CodeTypeOK, resp.Code, resp.Log)
+	})
+
+	txBytes := newSignedPayForFibreTx(t, newSigner(0), accounts[0], true)
+
+	resp, err := testApp.CheckTx(&abci.RequestCheckTx{Tx: txBytes, Type: abci.CheckTxType_New})
+	require.NoError(t, err)
+	require.Equal(t, abci.CodeTypeOK, resp.Code, resp.Log)
+	require.NotEmpty(t, resp.Address, "admission reports the signer the mempool keys its sender on")
+
+	// Each committed block resets the check state and the mempool rechecks the
+	// still pending tx against it.
+	for range 3 {
+		commitBlock(t, testApp)
+		resp, err = testApp.CheckTx(&abci.RequestCheckTx{Tx: txBytes, Type: abci.CheckTxType_Recheck})
+		require.NoError(t, err)
+		require.Equal(t, abci.CodeTypeOK, resp.Code, resp.Log)
+	}
+
+	// Truncated bytes are not a well formed pay-for-fibre, so they take the
+	// full path and fail there.
+	truncated := txBytes[:len(txBytes)-1]
+	require.False(t, fibretypes.IsPayForFibreTx(truncated))
+	resp, err = testApp.CheckTx(&abci.RequestCheckTx{Tx: truncated, Type: abci.CheckTxType_Recheck})
+	require.True(t, err != nil || resp.Code != abci.CodeTypeOK)
+}
+
+// TestCheckTxPayForFibreReplay settles a payment promise in a committed block
+// and then rejects a fresh wrapper around the same promise in CheckTx, so
+// replayed promises neither enter the mempool nor survive recheck.
+func TestCheckTxPayForFibreReplay(t *testing.T) {
+	enc := encoding.MakeConfig(app.ModuleEncodingRegisters...)
+	accounts := testfactory.GenerateAccounts(1)
+	testApp, kr := testutil.SetupTestAppWithGenesisValSet(app.DefaultConsensusParams(), accounts...)
+	commitBlock(t, testApp)
+	infos := queryAccountInfo(testApp, accounts, kr)
+
+	signer := newSignerFactory(t, kr, enc.TxConfig, accounts, infos)(0)
+	seedFibreEscrow(t, testApp, testfactory.GetAddress(kr, accounts[0]), 1_000_000)
+
+	// Two envelopes with sequential nonces around the same promise.
+	promiseTime := time.Now()
+	txs := newPayForFibreTxPair(t, signer, accounts[0], promiseTime, promiseTime)
+	original, replay := txs[0], txs[1]
+
+	resp, err := testApp.CheckTx(&abci.RequestCheckTx{Tx: original, Type: abci.CheckTxType_New})
+	require.NoError(t, err)
+	require.Equal(t, abci.CodeTypeOK, resp.Code, resp.Log)
+
+	// Settle the promise in a committed block.
+	finalizeResp := commitBlock(t, testApp, original)
+	require.Len(t, finalizeResp.TxResults, 1)
+	require.Equal(t, abci.CodeTypeOK, finalizeResp.TxResults[0].Code, finalizeResp.TxResults[0].Log)
+
+	for name, checkTxType := range map[string]abci.CheckTxType{
+		"checktx": abci.CheckTxType_New,
+		"recheck": abci.CheckTxType_Recheck,
+	} {
+		t.Run("replayed promise is rejected on "+name, func(t *testing.T) {
+			resp, err := testApp.CheckTx(&abci.RequestCheckTx{Tx: replay, Type: checkTxType})
+			require.NoError(t, err)
+			require.NotEqual(t, abci.CodeTypeOK, resp.Code)
+			require.Contains(t, resp.Log, "already been processed")
+		})
+	}
+}
+
+// TestCheckTxPayForFibreRecheckExpiry admits a payment promise and then
+// advances block time past its timeout, so recheck must reject the expired
+// promise and the mempool evicts it instead of proposing a stale PFF. The
+// rejected recheck is also the one case the two paths are told apart by: it is
+// served from the entry, and serving it is what drops it.
+func TestCheckTxPayForFibreRecheckExpiry(t *testing.T) {
+	enc := encoding.MakeConfig(app.ModuleEncodingRegisters...)
+	accounts := testfactory.GenerateAccounts(1)
+	testApp, kr := testutil.SetupTestAppWithGenesisValSet(app.DefaultConsensusParams(), accounts...)
+	commitBlock(t, testApp)
+	infos := queryAccountInfo(testApp, accounts, kr)
+
+	signer := newSignerFactory(t, kr, enc.TxConfig, accounts, infos)(0)
+	seedFibreEscrow(t, testApp, testfactory.GetAddress(kr, accounts[0]), 1_000_000)
+
+	txBytes := newSignedPayForFibreTx(t, signer, accounts[0], true)
+
+	resp, err := testApp.CheckTx(&abci.RequestCheckTx{Tx: txBytes, Type: abci.CheckTxType_New})
+	require.NoError(t, err)
+	require.Equal(t, abci.CodeTypeOK, resp.Code, resp.Log)
+
+	// Commit an empty block timestamped past the promise timeout but within
+	// the freshness window, so the promise is expired rather than too old.
+	commitBlockAt(t, testApp, time.Now().Add(fibretypes.DefaultPaymentPromiseTimeout+time.Minute))
+
+	resp, err = testApp.CheckTx(&abci.RequestCheckTx{Tx: txBytes, Type: abci.CheckTxType_Recheck})
+	require.NoError(t, err)
+	require.NotEqual(t, abci.CodeTypeOK, resp.Code)
+	require.Contains(t, resp.Log, "payment promise expired")
+}
+
+// commitBlock finalizes and commits a block of txs stamped time.Now, so the
+// CheckTx state carries a current block time for promise freshness checks.
+func commitBlock(t *testing.T, testApp *app.App, txs ...[]byte) *abci.ResponseFinalizeBlock {
+	t.Helper()
+	return commitBlockAt(t, testApp, time.Now(), txs...)
+}
+
+// commitBlockAt is commitBlock with an explicit block time.
+func commitBlockAt(t *testing.T, testApp *app.App, blockTime time.Time, txs ...[]byte) *abci.ResponseFinalizeBlock {
+	t.Helper()
+	resp, err := testApp.FinalizeBlock(&abci.RequestFinalizeBlock{
+		Time:   blockTime,
+		Height: testApp.LastBlockHeight() + 1,
+		Hash:   testApp.LastCommitID().Hash,
+		Txs:    txs,
+	})
+	require.NoError(t, err)
+	_, err = testApp.Commit()
+	require.NoError(t, err)
+	return resp
+}
+
+// appendUnknownProtoField appends an unknown protobuf field (field 100, wire
+// type 2) of padLen zero bytes: proto.Unmarshal accepts it but MarshalBlobTx
+// drops it, yielding a valid-but-non-canonical blob tx encoding.
+func appendUnknownProtoField(raw []byte, padLen int) []byte {
+	varint := func(v uint64) []byte {
+		var out []byte
+		for v >= 0x80 {
+			out = append(out, byte(v)|0x80)
+			v >>= 7
+		}
+		return append(out, byte(v))
+	}
+	out := make([]byte, 0, len(raw)+padLen+8)
+	out = append(out, raw...)
+	out = append(out, varint(uint64(100)<<3|2)...)
+	out = append(out, varint(uint64(padLen))...)
+	out = append(out, make([]byte, padLen)...)
+	return out
+}

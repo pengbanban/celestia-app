@@ -1,0 +1,51 @@
+frontend/node_modules
+frontend/dist
+frontend/.cache
+secret.yml
+build
+coverage.txt
+.idea
+.vscode
+tools/lumina-latency-monitor/target
+tools/rust-fibre-txsim/target
+tools-stamp
+__debug_bin*
+profile.out
+tmp/
+run.sh
+testing/e2e/networks/*/
+square/testdata
+**/*.html
+.release-env
+**/*.DS_Store
+vendor
+go.work
+go.work.sum
+.envrc
+# test artifacts
+app/test/bad_block_*
+# do not include downloaded embedded binaries
+internal/embedding/**
+**/*token.sh
+# ignore talis files
+app.toml
+config.toml
+config.json
+memory-bank/*
+.clinerules
+tools/talis/talis
+talis-setup/
+.gocache
+.cache
+.gomodcache
+# Claude Code: ignore local settings, keep shared skills and agents
+.claude/*
+!.claude/skills
+!.claude/agents/
+# AI assumptions notes are never committed
+docs/plans/
+# Swagger UI page (override **/*.html)
+!docs/swagger/index.html
+# Swagger generation artifacts
+tmp-swagger-gen/
+docs/swagger/swagger.json

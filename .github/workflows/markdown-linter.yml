@@ -1,0 +1,40 @@
+name: markdown-linter
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  markdown-lint:
+    # Run only on PRs. Broken markdown doesn't affect the chain so it doesn't
+    # need to gate the merge queue.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 #v7.1.0
+        with:
+          node-version: 24.22.1
+
+      - name: Install markdownlint-cli
+        run: npm install -g markdownlint-cli@0.49.1
+        shell: bash
+
+      - name: Run markdownlint
+        run: markdownlint --config .markdownlint.yaml '**/*.md'
+        shell: bash
+
+  markdown-link-check:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+
+      - name: Run markdown link check
+        uses: gaurav-nelson/github-action-markdown-link-check@1.0.17
+        with:
+          config-file: '.github/markdown-link-check-config.json'
+          folder-path: '.'

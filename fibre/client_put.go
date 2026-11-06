@@ -1,0 +1,277 @@
+package fibre
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"cosmossdk.io/math"
+	"github.com/celestiaorg/celestia-app/v11/pkg/user"
+	"github.com/celestiaorg/celestia-app/v11/x/fibre/types"
+	"github.com/celestiaorg/go-square/v4/share"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// PutResult contains the result of a [Client.Put] operation.
+type PutResult struct {
+	// BlobID uniquely identifies the uploaded blob.
+	BlobID BlobID
+	// ValidatorSignatures are ed25519 signatures over the [PaymentPromise] sign bytes.
+	ValidatorSignatures [][]byte
+	// TTL is the time-to-live for the [Blob].
+	TTL time.Time
+	// TxHash is the transaction hash of the [types.MsgPayForFibre].
+	TxHash string
+	// Height is the block height where the [types.MsgPayForFibre] transaction was included.
+	Height uint64
+}
+
+// escrowReservation is a single Put's handle on its escrow admission. The zero
+// value (returned when AutoFund is disabled) makes abort a no-op.
+type escrowReservation struct {
+	ledger *escrowLedger
+	amount math.Int
+	signed bool
+}
+
+// admitEscrow debits blob's settlement cost from txClient's local escrow budget
+// before signing/uploading, so concurrent in-flight promises can never
+// collectively overcommit the account (the failure mode neither the server's
+// per-promise check nor a fixed upfront deposit prevents). It blocks —
+// auto-funding as needed — until the budget is available, kicking a refill off
+// the hot path whenever the budget dips low. Returns the zero reservation when
+// AutoFund is disabled.
+func (c *Client) admitEscrow(ctx context.Context, txClient *user.TxClient, blob *Blob) (escrowReservation, error) {
+	if !c.Config.Escrow.AutoFund {
+		return escrowReservation{}, nil
+	}
+	ledger := c.escrowLedgerFor(txClient)
+	amount := types.PaymentAmount(uint32(blob.UploadSize())).Amount
+	if err := ledger.ensureSeeded(ctx); err != nil {
+		return escrowReservation{}, fmt.Errorf("seeding escrow ledger: %w", err)
+	}
+	ok, low := ledger.admit(amount)
+	if !ok {
+		// Blocked path: refill synchronously — this Put is already waiting for
+		// budget, so a deposit inline (bounded by ctx) needs no extra goroutine.
+		if err := ledger.waitForBudget(ctx, func() { ledger.refill(ctx) }, amount); err != nil {
+			return escrowReservation{}, fmt.Errorf("waiting for escrow budget: %w", err)
+		}
+	} else if low {
+		// Admitted but low: kick a best-effort proactive top-up off the hot path
+		// so the next Put is unlikely to block.
+		c.refillAsync(ledger)
+	}
+	return escrowReservation{ledger: ledger, amount: amount}, nil
+}
+
+// abort returns the debited budget for a Put that failed before its promise was
+// signed (encoding/upload failed, so the funds were never committed). Safe to
+// defer unconditionally: it is a no-op once the promise is signed, since from
+// that point the escrow is committed — the settle or timeout path debits it on
+// chain regardless of whether this Put's broadcast/confirm succeeds.
+func (r *escrowReservation) abort() {
+	if r.ledger != nil && !r.signed {
+		r.ledger.credit(r.amount)
+	}
+}
+
+// Put uploads given data to the Fibre network.
+// It encodes the data into a [Blob], calls [Client.Upload] to upload it,
+// and submits a MsgPayForFibre transaction using the provided [user.TxClient].
+// Returns [ErrNoKeyring] if the Fibre client has no keyring.
+//
+// TODO(@Wondertan): This does not belong here. Fibre protocol in it's core doesn't need to know about transactions.
+// Furthermore, this function cannot be generalized for all the cases with fee grants, multiple key managements, etc.
+// And users are strongly advised to use [fibre.Upload] with custom TX submission logic instead, ideally batching multiple blobs in a single PFF.
+func Put(ctx context.Context, c *Client, txClient *user.TxClient, ns share.Namespace, data []byte) (result PutResult, err error) {
+	if c.keyring == nil {
+		return result, ErrNoKeyring
+	}
+
+	ctx, span := c.tracer.Start(ctx, "fibre.Client.Put",
+		trace.WithAttributes(
+			attribute.String("namespace", ns.String()),
+			attribute.Int("data_size", len(data)),
+		),
+	)
+	defer span.End()
+
+	blobID, signedPromise, err := uploadPut(ctx, c, txClient, ns, data)
+	if err != nil {
+		return result, err
+	}
+
+	// broadcast PayForFibre transaction
+	promiseProto, err := signedPromise.ToProto()
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to convert payment promise to proto")
+		return result, fmt.Errorf("converting payment promise to proto: %w", err)
+	}
+	signerAddr := txClient.DefaultAddress()
+	msg := &types.MsgPayForFibre{
+		Signer:              signerAddr.String(),
+		PaymentPromise:      *promiseProto,
+		ValidatorSignatures: signedPromise.ValidatorSignatures,
+	}
+
+	broadcastResp, err := retryPFFBroadcast(ctx, func(ctx context.Context) (*sdk.TxResponse, error) {
+		return txClient.BroadcastTx(ctx, []sdk.Msg{msg})
+	})
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to broadcast PayForFibre transaction")
+		return result, fmt.Errorf("broadcasting PayForFibre transaction: %w", err)
+	}
+	span.AddEvent("pff_broadcasted", trace.WithAttributes(
+		attribute.String("pff_hash", broadcastResp.TxHash),
+	))
+
+	// confirm transaction inclusion
+	txResp, err := txClient.ConfirmTxSubscription(ctx, broadcastResp.TxHash)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to confirm PayForFibre transaction")
+		return result, fmt.Errorf("confirming PayForFibre transaction: %w", err)
+	}
+	span.AddEvent("pff_confirmed", trace.WithAttributes(
+		attribute.Int64("height", txResp.Height),
+	))
+
+	span.SetStatus(codes.Ok, "")
+	return PutResult{
+		BlobID:              blobID,
+		ValidatorSignatures: signedPromise.ValidatorSignatures,
+		TxHash:              txResp.TxHash,
+		Height:              uint64(txResp.Height),
+	}, nil
+}
+
+// uploadPut releases its blob ownership before transaction settlement.
+func uploadPut(ctx context.Context, c *Client, txClient *user.TxClient, ns share.Namespace, data []byte) (BlobID, SignedPaymentPromise, error) {
+	span := trace.SpanFromContext(ctx)
+	// Check lifecycle before admission so an unusable client fails fast instead
+	// of waiting for capacity.
+	if !c.started.Load() {
+		return nil, SignedPaymentPromise{}, errClientNotStarted
+	}
+	if c.closed.Load() {
+		return nil, SignedPaymentPromise{}, ErrClientClosed
+	}
+	release, err := c.acquirePutMemory(ctx)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Put memory admission failed")
+		return nil, SignedPaymentPromise{}, err
+	}
+	blob, err := NewBlob(data, DefaultBlobConfigV0())
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to encode blob")
+		release()
+		return nil, SignedPaymentPromise{}, err
+	}
+	// Release admission with the encoded storage, after the last upload reader.
+	free := blob.releaseFn
+	blob.releaseFn = func() {
+		free()
+		release()
+	}
+	defer blob.Free()
+
+	blobID := blob.ID()
+	span.AddEvent("blob_encoded", trace.WithAttributes(
+		attribute.String("blob_id", blobID.String()),
+		attribute.Int("row_size", blob.RowSize()),
+	))
+
+	// Escrow admission: debit this promise's settlement cost before signing and
+	// uploading. Credited back (via the deferred abort) on any error before the
+	// promise is signed; once signed the funds are committed and stay debited.
+	// No-op when AutoFund is disabled.
+	reservation, err := c.admitEscrow(ctx, txClient, blob)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "escrow admission failed")
+		return nil, SignedPaymentPromise{}, err
+	}
+	defer reservation.abort()
+
+	// Commit the reservation the moment the promise is client-signed and about to
+	// be dispatched (via the beforeFanout hook), not after Upload returns: once a
+	// validator can hold the signed promise it may land on-chain through the
+	// timeout path even if the fanout errors, so crediting the budget back on
+	// such an error would let a later Put overspend the escrow.
+	signedPromise, err := c.Upload(ctx, ns, blob,
+		WithKeyName(txClient.DefaultAccountName()),
+		withBeforeDispatch(func() { reservation.signed = true }),
+	)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to upload blob")
+		return nil, SignedPaymentPromise{}, err
+	}
+	span.AddEvent("blob_uploaded", trace.WithAttributes(
+		attribute.Int("sigs_amount", len(signedPromise.ValidatorSignatures)),
+	))
+
+	return blobID, signedPromise, nil
+}
+
+// pffBroadcastAttempts and pffBroadcastRetryDelay bound the re-broadcast of a
+// PayForFibre rejected because the promise's signing height is not yet
+// committed app-side.
+const (
+	pffBroadcastAttempts   = 4
+	pffBroadcastRetryDelay = 500 * time.Millisecond
+)
+
+// isMissingHistoricalInfo reports whether a broadcast rejection means the
+// promise's signing height is not yet committed app-side. The head is
+// observable from CometBFT's blockstore before the app finishes executing the
+// block, so this rejection is transient: the tx verifies once the app catches
+// up, moments later. See #7774.
+func isMissingHistoricalInfo(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "failed to get historical validator set")
+}
+
+// retryPFFBroadcast broadcasts a PayForFibre, re-broadcasting after a short
+// delay while the rejection is the transient missing-historical-info one.
+func retryPFFBroadcast(ctx context.Context, broadcast func(context.Context) (*sdk.TxResponse, error)) (*sdk.TxResponse, error) {
+	resp, err := broadcast(ctx)
+	for attempt := 1; attempt < pffBroadcastAttempts && isMissingHistoricalInfo(err); attempt++ {
+		select {
+		case <-ctx.Done():
+			return resp, err
+		case <-time.After(pffBroadcastRetryDelay):
+		}
+		resp, err = broadcast(ctx)
+	}
+	return resp, err
+}
+
+// acquirePutMemory runs [ClientConfig.AcquirePutMemory], if set. The returned
+// release is never nil and is safe to call more than once.
+func (c *Client) acquirePutMemory(ctx context.Context) (func(), error) {
+	acquire := c.Config.AcquirePutMemory
+	if acquire == nil {
+		return func() {}, nil
+	}
+	span := trace.SpanFromContext(ctx)
+	span.AddEvent("put_memory_wait_started")
+	release, err := acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring Put memory: %w", err)
+	}
+	span.AddEvent("put_memory_acquired")
+	if release == nil {
+		return func() {}, nil
+	}
+	return sync.OnceFunc(release), nil
+}

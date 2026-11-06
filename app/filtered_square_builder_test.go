@@ -1,0 +1,348 @@
+package app
+
+import (
+	"bytes"
+	"io"
+	"math"
+	"runtime"
+	"strings"
+	"testing"
+
+	"cosmossdk.io/log"
+	"cosmossdk.io/store"
+	"cosmossdk.io/store/metrics"
+	"github.com/celestiaorg/celestia-app/v11/app/encoding"
+	"github.com/celestiaorg/celestia-app/v11/pkg/appconsts"
+	"github.com/celestiaorg/celestia-app/v11/test/util/blobfactory"
+	blobtypes "github.com/celestiaorg/celestia-app/v11/x/blob/types"
+	"github.com/celestiaorg/go-square/v4/proto/blob/v4"
+	"github.com/celestiaorg/go-square/v4/share"
+	"github.com/celestiaorg/go-square/v4/tx"
+	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
+	coretypes "github.com/cometbft/cometbft/types"
+	dbm "github.com/cosmos/cosmos-db"
+	"github.com/cosmos/cosmos-sdk/client"
+	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+)
+
+func TestSeparateTxs(t *testing.T) {
+	encConf := encoding.MakeConfig(ModuleEncodingRegisters...)
+	txConfig := encConf.TxConfig
+
+	normalTx := newNormalTx(t, txConfig)
+	blobTx := blobfactory.UnsignedBlobTx(t)
+
+	tests := []struct {
+		name     string
+		rawTxs   [][]byte
+		wantNorm int
+		wantBlob int
+		wantPFF  int
+	}{
+		{
+			name:     "empty",
+			rawTxs:   [][]byte{},
+			wantNorm: 0,
+			wantBlob: 0,
+			wantPFF:  0,
+		},
+		{
+			name:     "one normal tx",
+			rawTxs:   [][]byte{normalTx},
+			wantNorm: 1,
+			wantBlob: 0,
+			wantPFF:  0,
+		},
+		{
+			name:     "one blob tx",
+			rawTxs:   [][]byte{blobTx},
+			wantNorm: 0,
+			wantBlob: 1,
+			wantPFF:  0,
+		},
+		{
+			name:     "undecodable tx is dropped",
+			rawTxs:   [][]byte{[]byte("garbage")},
+			wantNorm: 0,
+			wantBlob: 0,
+			wantPFF:  0,
+		},
+		{
+			// A proto-valid v4.BlobTx with TypeId="BLOB" but no blobs is classified as a
+			// blob tx by its type ID; Fill decodes and drops it.
+			name:     "malformed blob tx with no blobs is classified as a blob tx",
+			rawTxs:   [][]byte{mustMarshal(t, &v4.BlobTx{TypeId: "BLOB"})},
+			wantNorm: 0,
+			wantBlob: 1,
+			wantPFF:  0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			normalTxs, rawBlobTxs, payForFibreTxs := separateTxsDecoded(log.NewNopLogger(), txConfig, tc.rawTxs)
+			require.Len(t, normalTxs, tc.wantNorm)
+			require.Len(t, rawBlobTxs, tc.wantBlob)
+			require.Len(t, payForFibreTxs, tc.wantPFF)
+		})
+	}
+}
+
+func mustMarshal(t *testing.T, m proto.Message) []byte {
+	t.Helper()
+	b, err := proto.Marshal(m)
+	require.NoError(t, err)
+	return b
+}
+
+// newNormalTx creates an unsigned MsgSend transaction for testing.
+func newNormalTx(t *testing.T, txConfig client.TxConfig) []byte {
+	t.Helper()
+	return newNormalTxWithMemo(t, txConfig, "")
+}
+
+// newNormalTxWithMemo creates an unsigned MsgSend tx with the given memo, used
+// to control the encoded size of the tx in tests.
+func newNormalTxWithMemo(t *testing.T, txConfig client.TxConfig, memo string) []byte {
+	t.Helper()
+	privKey := secp256k1.GenPrivKey()
+	addr := sdk.AccAddress(privKey.PubKey().Address())
+	msg := &banktypes.MsgSend{
+		FromAddress: addr.String(),
+		ToAddress:   addr.String(),
+		Amount:      sdk.NewCoins(sdk.NewInt64Coin("utia", 1)),
+	}
+	builder := txConfig.NewTxBuilder()
+	require.NoError(t, builder.SetMsgs(msg))
+	builder.SetMemo(memo)
+	txBytes, err := txConfig.TxEncoder()(builder.GetTx())
+	require.NoError(t, err)
+	return txBytes
+}
+
+// newBlobTx creates a wire-valid BlobTx whose inner SDK tx wraps a real
+// MsgPayForBlobs (rather than the nil inner tx used by
+// blobfactory.UnsignedBlobTx).
+func newBlobTx(t *testing.T, txConfig client.TxConfig) []byte {
+	t.Helper()
+	privKey := secp256k1.GenPrivKey()
+	addr := sdk.AccAddress(privKey.PubKey().Address())
+
+	ns := share.MustNewV0Namespace([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
+	blob, err := share.NewBlob(ns, []byte("test blob"), share.ShareVersionZero, nil)
+	require.NoError(t, err)
+
+	msg, err := blobtypes.NewMsgPayForBlobs(addr.String(), appconsts.Version, blob)
+	require.NoError(t, err)
+
+	builder := txConfig.NewTxBuilder()
+	require.NoError(t, builder.SetMsgs(msg))
+	rawSdkTx, err := txConfig.TxEncoder()(builder.GetTx())
+	require.NoError(t, err)
+
+	blobTxBytes, err := tx.MarshalBlobTx(rawSdkTx, blob)
+	require.NoError(t, err)
+	return blobTxBytes
+}
+
+func TestFilteredSquareBuilderFillMaxTxBytes(t *testing.T) {
+	encConf := encoding.MakeConfig(ModuleEncodingRegisters...)
+	txConfig := encConf.TxConfig
+
+	alwaysPass := func(ctx sdk.Context, _ sdk.Tx, _ bool) (sdk.Context, error) {
+		return ctx, nil
+	}
+
+	// Fill budgets each tx by its protobuf-encoded size (the same figure Core
+	// validates against), not raw len(tx), so the boundaries below use that.
+	framedSize := func(tx []byte) int64 {
+		return coretypes.ComputeProtoSizeForTxs([]coretypes.Tx{tx})
+	}
+
+	// Three txs of identical size for cumulative max tx bytes tests.
+	tx1 := newNormalTx(t, txConfig)
+	tx2 := newNormalTx(t, txConfig)
+	tx3 := newNormalTx(t, txConfig)
+	require.Equal(t, len(tx1), len(tx2))
+	require.Equal(t, len(tx1), len(tx3))
+	normalTxSize := framedSize(tx1)
+
+	// A small and a larger tx for the "continue, not break" test: a high-priority
+	// tx that exceeds max tx bytes should be skipped, but a smaller subsequent
+	// tx should still fit.
+	smallTx := newNormalTx(t, txConfig)
+	largeTx := newNormalTxWithMemo(t, txConfig, strings.Repeat("a", 1024))
+	require.Less(t, len(smallTx), len(largeTx))
+
+	// A blob tx — the full encoded size (inner tx + blob data) must be the
+	// number used for the byte budget, not just the inner tx size.
+	blobTx := blobfactory.UnsignedBlobTx(t)
+	blobTxSize := framedSize(blobTx)
+
+	// A blob tx with a real MsgPayForBlobs inside (non-nil inner SDK tx).
+	signedBlobTx := newBlobTx(t, txConfig)
+	signedBlobTxSize := framedSize(signedBlobTx)
+
+	tests := []struct {
+		name       string
+		txs        [][]byte
+		maxTxBytes int64
+		wantKept   int
+	}{
+		{
+			name:       "all txs fit when max tx bytes is unbounded",
+			txs:        [][]byte{tx1, tx2, tx3},
+			maxTxBytes: math.MaxInt64,
+			wantKept:   3,
+		},
+		{
+			name:       "first tx alone exceeds max tx bytes",
+			txs:        [][]byte{tx1, tx2, tx3},
+			maxTxBytes: normalTxSize - 1,
+			wantKept:   0,
+		},
+		{
+			name:       "max tx bytes fits exactly one tx",
+			txs:        [][]byte{tx1, tx2, tx3},
+			maxTxBytes: normalTxSize,
+			wantKept:   1,
+		},
+		{
+			name:       "max tx bytes fits exactly two txs",
+			txs:        [][]byte{tx1, tx2, tx3},
+			maxTxBytes: 2 * normalTxSize,
+			wantKept:   2,
+		},
+		{
+			name:       "smaller later tx fits after larger one is skipped",
+			txs:        [][]byte{largeTx, smallTx},
+			maxTxBytes: framedSize(smallTx),
+			wantKept:   1,
+		},
+		{
+			name:       "blob tx size counted, not just inner tx",
+			txs:        [][]byte{blobTx},
+			maxTxBytes: blobTxSize - 1,
+			wantKept:   0,
+		},
+		{
+			name:       "normal and blob tx share the same max tx bytes",
+			txs:        [][]byte{tx1, blobTx},
+			maxTxBytes: normalTxSize + blobTxSize - 1,
+			wantKept:   1,
+		},
+		{
+			name:       "blob tx with inner SDK tx counted at full marshaled size",
+			txs:        [][]byte{signedBlobTx},
+			maxTxBytes: signedBlobTxSize - 1,
+			wantKept:   0,
+		},
+		{
+			name:       "blob tx with real inner SDK tx fits when max tx bytes allows it",
+			txs:        [][]byte{signedBlobTx},
+			maxTxBytes: signedBlobTxSize,
+			wantKept:   1,
+		},
+	}
+
+	// Use a max square size large enough that the square is never the limiting
+	// factor — only max tx bytes is. This mirrors the scenario the byte filter
+	// is meant to guard against: gov max square size much larger than the
+	// configured block max bytes.
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fsb, err := NewFilteredSquareBuilder(alwaysPass, nil, txConfig, fakeChannelKeeper{}, appconsts.SquareSizeUpperBound, appconsts.SubtreeRootThreshold)
+			require.NoError(t, err)
+
+			db := dbm.NewMemDB()
+			ms := store.NewCommitMultiStore(db, log.NewNopLogger(), metrics.NewNoOpMetrics())
+			ctx := sdk.NewContext(ms, cmtproto.Header{}, false, log.NewNopLogger())
+
+			kept := fsb.Fill(ctx, tc.txs, tc.maxTxBytes)
+			require.Len(t, kept, tc.wantKept)
+		})
+	}
+}
+
+// skippedBlobTxsFixture builds 64 blob transactions of 1 MiB each, more than
+// fit in a block, and a context whose logger drops debug lines.
+func skippedBlobTxsFixture(tb testing.TB) (client.TxConfig, sdk.Context, [][]byte) {
+	tb.Helper()
+	txConfig := encoding.MakeConfig(ModuleEncodingRegisters...).TxConfig
+	ns := share.MustNewV0Namespace([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
+	txs := make([][]byte, 64)
+	for i := range txs {
+		blob, err := share.NewBlob(ns, bytes.Repeat([]byte{byte(i)}, 1<<20), share.ShareVersionZero, nil)
+		require.NoError(tb, err)
+		msg, err := blobtypes.NewMsgPayForBlobs(sdk.AccAddress(secp256k1.GenPrivKey().PubKey().Address()).String(), appconsts.Version, blob)
+		require.NoError(tb, err)
+		builder := txConfig.NewTxBuilder()
+		require.NoError(tb, builder.SetMsgs(msg))
+		rawSdkTx, err := txConfig.TxEncoder()(builder.GetTx())
+		require.NoError(tb, err)
+		txs[i], err = tx.MarshalBlobTx(rawSdkTx, blob)
+		require.NoError(tb, err)
+	}
+	logger := log.NewLogger(io.Discard, log.LevelOption(zerolog.InfoLevel))
+	ms := store.NewCommitMultiStore(dbm.NewMemDB(), log.NewNopLogger(), metrics.NewNoOpMetrics())
+	return txConfig, sdk.NewContext(ms, cmtproto.Header{}, false, logger), txs
+}
+
+// Hashing a skipped blob tx decodes its whole envelope, so Fill allocated
+// several times the block's tx bytes when it hashed every skipped tx for a
+// debug line that was then dropped.
+func TestFillDoesNotHashSkippedTxsBelowLogLevel(t *testing.T) {
+	txConfig, ctx, txs := skippedBlobTxsFixture(t)
+	alwaysPass := func(ctx sdk.Context, _ sdk.Tx, _ bool) (sdk.Context, error) {
+		return ctx, nil
+	}
+	var txBytes uint64
+	for _, raw := range txs {
+		txBytes += uint64(len(raw))
+	}
+	fsb, err := NewFilteredSquareBuilder(alwaysPass, nil, txConfig, fakeChannelKeeper{}, appconsts.SquareSizeUpperBound, appconsts.SubtreeRootThreshold)
+	require.NoError(t, err)
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	kept := fsb.Fill(ctx, txs, 8<<20)
+	runtime.ReadMemStats(&after)
+
+	require.Less(t, len(kept), len(txs), "nothing was skipped")
+	allocated := after.TotalAlloc - before.TotalAlloc
+	require.Less(t, allocated, txBytes, "Fill allocated %d bytes for %d bytes of txs", allocated, txBytes)
+}
+
+// BenchmarkFillSkippedBlobTxs measures Fill on a block that has more blob
+// transactions than fit, so most are skipped and only logged at debug level.
+func BenchmarkFillSkippedBlobTxs(b *testing.B) {
+	txConfig, ctx, txs := skippedBlobTxsFixture(b)
+	alwaysPass := func(ctx sdk.Context, _ sdk.Tx, _ bool) (sdk.Context, error) {
+		return ctx, nil
+	}
+
+	for _, bc := range []struct {
+		name          string
+		maxSquareSize int
+		maxTxBytes    int64
+	}{
+		{name: "max tx bytes", maxSquareSize: appconsts.SquareSizeUpperBound, maxTxBytes: 8 << 20},
+		{name: "square size", maxSquareSize: 128, maxTxBytes: 0},
+	} {
+		b.Run(bc.name, func(b *testing.B) {
+			for b.Loop() {
+				fsb, err := NewFilteredSquareBuilder(alwaysPass, nil, txConfig, fakeChannelKeeper{}, bc.maxSquareSize, appconsts.SubtreeRootThreshold)
+				require.NoError(b, err)
+				if kept := fsb.Fill(ctx, txs, bc.maxTxBytes); len(kept) >= len(txs) {
+					b.Fatalf("kept all %d txs; nothing was skipped", len(kept))
+				}
+			}
+		})
+	}
+}

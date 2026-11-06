@@ -1,0 +1,68 @@
+# CodeQL security analysis.
+#
+# This workflow addresses celestiaorg/celestia-app#5864 (the prior workflow did
+# not run on PRs). It runs on:
+#   - pull_request to any base        -> catches regressions before merge,
+#                                        including on stacked PRs whose base is
+#                                        another PR branch rather than main
+#   - push to main and v* branches    -> records results against protected refs
+#   - weekly schedule                 -> picks up new CodeQL rule releases
+#
+# Pinned to commit SHAs per repo convention. Version comments indicate the
+# human-readable tag each SHA corresponds to.
+name: "CodeQL"
+
+on:
+  push:
+    branches: ["main", "v*"]
+  pull_request:
+  schedule:
+    - cron: "24 20 * * 4"
+
+# Same rationale as ci-release.yml: a restack force-pushes every branch in a
+# stack at once, so obsolete pull_request runs are superseded. Scheduled and
+# push runs are never cancelled.
+concurrency:
+  group: codeql-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ["go"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "go.mod"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+
+      # Build the module explicitly instead of `make build`. `make build` runs
+      # the multiplexer and embeds legacy v3-v8 binaries, which is too slow for
+      # a security scan and unnecessary for CodeQL's Go extractor.
+      - name: Build Go packages
+        run: go build ./...
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: "/language:${{ matrix.language }}"

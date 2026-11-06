@@ -1,0 +1,675 @@
+package fibre
+
+import (
+	"bytes"
+	"context"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/celestiaorg/celestia-app/v11/x/fibre/types"
+	pebbledb "github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
+	gogoproto "github.com/cosmos/gogoproto/proto"
+)
+
+// Pebble stores promises, prune indexes, and shard markers. Each marker
+// identifies the backend (local || object) and size of its shard payload;
+// legacy markers use local storage.
+const (
+	shardKeyPrefix = "/shard/"
+	// maxPruneBatchSize bounds each index scan and Pebble commit. The server drains full
+	// batches during one prune pass.
+	maxPruneBatchSize = 1000
+)
+
+// ErrStoreNotFound is returned when no shard is found for a [Commitment] in the [Store].
+var ErrStoreNotFound = errors.New("no shard found in store")
+
+// ErrStoreIntegrity is returned when stored metadata is invalid.
+var ErrStoreIntegrity = errors.New("store integrity error")
+
+// Store manages persistent storage of [PaymentPromise] and row data.
+// It provides indexed access by [Commitment], promise hash, and timestamp.
+type Store struct {
+	db     *pebbledb.DB
+	log    *slog.Logger
+	shards *routedStorage
+
+	probe chan struct{} // one slot, held while a health probe runs
+}
+
+// probeCloseWait is how long [Store.Close] waits for a running health probe.
+var probeCloseWait = 5 * time.Second
+
+// memStorePath is an arbitrary location inside the in-memory FS used by
+// [NewMemoryStore]; both pebble's files and our shards/staging subdirs live
+// under it so the layout matches the on-disk store.
+const memStorePath = "/store"
+
+// NewMemoryStore creates a [Store] backed entirely by [vfs.NewMem]; both the
+// pebble metadata and the flat shard files live in memory and are dropped
+// when the Store is garbage collected.
+func NewMemoryStore(cfg StoreConfig) *Store {
+	cfg.Path = memStorePath
+	cfg.StorageBackend = storageBackendLocal
+	s, err := openStore(context.Background(), cfg, vfs.NewMem())
+	if err != nil {
+		panic(fmt.Sprintf("opening in-memory store: %v", err))
+	}
+	return s
+}
+
+// NewStore opens Pebble and the configured shard backends at cfg.Path.
+// It removes leftover staging files from a previous crash.
+func NewStore(ctx context.Context, cfg StoreConfig) (*Store, error) {
+	return openStore(ctx, cfg, vfs.Default)
+}
+
+func openStore(ctx context.Context, cfg StoreConfig, filesystem vfs.FS) (*Store, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validating store config: %w", err)
+	}
+
+	opts := &pebbledb.Options{FS: filesystem}
+	// Values in pebble are sub-1KB metadata only; tuning is light.
+	opts.MemTableSize = 16 << 20
+	opts.L0CompactionThreshold = 4
+	opts.L0StopWritesThreshold = 12
+	opts.LBaseMaxBytes = 64 << 20
+
+	db, err := pebbledb.Open(cfg.Path, opts)
+	if err != nil {
+		return nil, fmt.Errorf("opening pebble database: %w", err)
+	}
+
+	s := &Store{db: db, log: cfg.Log, probe: make(chan struct{}, 1)}
+	s.shards, err = openRoutedStorage(ctx, cfg, db, filesystem)
+	if err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("opening shard storage: %w", err)
+	}
+	if err := s.reconcile(); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("reconciling store: %w", err)
+	}
+	return s, nil
+}
+
+// Put stores a [PaymentPromise] and [types.BlobShard] using a stage → publish
+// → commit pattern: write tmp under staging/, rename into shards/<commit>-<hash>,
+// then commit pebble metadata. A crash between rename and commit can leave an
+// orphan file.
+// Puts for the same commitment but different promises are stored independently
+// without deduplication.
+func (s *Store) Put(ctx context.Context, promise *PaymentPromise, shard *types.BlobShard, pruneAt time.Time) error {
+	// Respect a client that has already gone away: skip the staging write
+	// entirely rather than doing work whose result nobody is waiting for.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("aborting store put: %w", err)
+	}
+
+	promiseHash, err := promise.Hash()
+	if err != nil {
+		return fmt.Errorf("getting promise hash: %w", err)
+	}
+
+	size := shardBinarySize(shard)
+	if size > maxPlausibleShardSize {
+		return fmt.Errorf("shard size %d exceeds maximum %d", size, maxPlausibleShardSize)
+	}
+	marker := s.shards.marker(size)
+	return s.commitAndStore(ctx, promise, promiseHash, shard, marker, pruneAt)
+}
+
+// commitAndStore writes the shard payload, then commits its Pebble metadata.
+func (s *Store) commitAndStore(
+	ctx context.Context,
+	promise *PaymentPromise,
+	promiseHash []byte,
+	shard *types.BlobShard,
+	marker []byte,
+	pruneAt time.Time,
+) error {
+	promiseProto, err := promise.ToProto()
+	if err != nil {
+		return fmt.Errorf("converting payment promise to proto: %w", err)
+	}
+	ppData, err := gogoproto.Marshal(promiseProto)
+	if err != nil {
+		return fmt.Errorf("marshaling payment promise: %w", err)
+	}
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := batch.Set(promiseKey(promiseHash), ppData, pebbledb.NoSync); err != nil {
+		return fmt.Errorf("putting payment promise: %w", err)
+	}
+	if err := batch.Set(shardKey(promise.Commitment, promiseHash), marker, pebbledb.NoSync); err != nil {
+		return fmt.Errorf("putting shard marker: %w", err)
+	}
+	if err := batch.Set(pruneKey(pruneAt, promise.Commitment, promiseHash), nil, pebbledb.NoSync); err != nil {
+		return fmt.Errorf("putting prune index: %w", err)
+	}
+
+	// Last safe point to honour cancellation before the durable payload write.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("aborting store commit: %w", err)
+	}
+
+	// The marker routes the write and any commit-failure cleanup to the same backend.
+	err = s.shards.Put(ctx, marker, promise.Commitment, promiseHash, shard)
+	if err != nil {
+		return fmt.Errorf("storing shard payload: %w", err)
+	}
+	if err := batch.Commit(pebbledb.NoSync); err != nil {
+		if s.shardMarkerMissing(promise.Commitment, promiseHash) {
+			if rmErr := s.shards.Delete(context.Background(), marker, promise.Commitment, promiseHash); rmErr != nil {
+				s.log.Warn("failed to remove orphaned shard after commit failure",
+					"commitment", promise.Commitment.String(), "error", rmErr)
+			}
+		}
+		return fmt.Errorf("committing metadata: %w", err)
+	}
+
+	return nil
+}
+
+// Get returns the first [types.BlobShard] found for the given [Commitment].
+// When multiple promises exist for the same commitment, returning only the
+// first prevents unbounded message sizes; pebble's deterministic key order
+// makes the choice consistent across validators.
+//
+// A marker with a missing payload remains until pruning so its recorded size
+// can be released from occupancy.
+func (s *Store) Get(ctx context.Context, commitment Commitment) (*types.BlobShard, error) {
+	prefix := fmt.Appendf(nil, "%s%s/", shardKeyPrefix, commitment.String())
+	iter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating iterator: %w", err)
+	}
+	defer iter.Close()
+
+	var rerr error
+	for valid := iter.First(); valid; valid = iter.Next() {
+		promiseHashHex := string(iter.Key()[len(prefix):])
+		promiseHash, err := hex.DecodeString(promiseHashHex)
+		if err != nil {
+			rerr = errors.Join(rerr, fmt.Errorf("decoding promise hash from shard key: %w", err))
+			continue
+		}
+
+		shard, err := s.shards.Get(ctx, iter.Value(), commitment, promiseHash)
+		if err == nil {
+			return shard, nil
+		}
+		if errors.Is(err, ErrStoreNotFound) {
+			continue
+		}
+		rerr = errors.Join(rerr, fmt.Errorf("reading shard payload: %w", err))
+	}
+
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("iterating shards: %w", err)
+	}
+	if rerr != nil {
+		return nil, rerr
+	}
+	return nil, ErrStoreNotFound
+}
+
+// Has verifies that shard exists without reading the whole file
+func (s *Store) Has(ctx context.Context, commitment Commitment, promiseHash []byte) (bool, error) {
+	has, _, err := s.shardStatus(ctx, commitment, promiseHash)
+	return has, err
+}
+
+// shardStatus reports whether the payload exists and its marker counts towards occupancy.
+func (s *Store) shardStatus(ctx context.Context, commitment Commitment, promiseHash []byte) (bool, bool, error) {
+	markerData, closer, err := s.db.Get(shardKey(commitment, promiseHash))
+	var accounted bool
+	switch {
+	case errors.Is(err, pebbledb.ErrNotFound):
+		return false, false, nil
+	case err != nil:
+		return false, false, fmt.Errorf("checking if shard exists failed: %w", err)
+	default:
+		accounted = len(markerData) > 0
+		// Pebble owns markerData until the closer closes.
+		markerData = slices.Clone(markerData)
+		_ = closer.Close()
+	}
+
+	has, err := s.shards.Has(ctx, markerData, commitment, promiseHash)
+	if err != nil {
+		return false, false, err
+	}
+	return has, accounted, nil
+}
+
+// shardMarkerMissing reports confirmed absence. Read errors must not permit deletion.
+func (s *Store) shardMarkerMissing(commit Commitment, promiseHash []byte) bool {
+	_, closer, err := s.db.Get(shardKey(commit, promiseHash))
+	switch {
+	case err == nil:
+		_ = closer.Close()
+		return false
+	case errors.Is(err, pebbledb.ErrNotFound):
+		return true
+	default:
+		s.log.Warn("failed to check shard marker", "commitment", commit.String(), "error", err)
+		return false
+	}
+}
+
+// Size returns the marker-accounted encoded size of stored shards. It stats
+// existing local payloads for empty legacy markers. If invalid metadata is
+// skipped, it returns the usable partial total with [ErrStoreIntegrity]. All
+// other errors return zero.
+func (s *Store) Size(ctx context.Context) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	prefix := []byte(shardKeyPrefix)
+	iter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("creating iterator: %w", err)
+	}
+	defer iter.Close()
+
+	var (
+		totalSize      int64
+		integrityErr   error
+		invalidEntries int
+	)
+	for valid := iter.First(); valid; valid = iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+
+		commitment, promiseHash, ok := parseShardKey(string(iter.Key()))
+		if !ok {
+			invalidEntries++
+			if integrityErr == nil {
+				integrityErr = fmt.Errorf("%w: invalid shard key %q", ErrStoreIntegrity, iter.Key())
+			}
+			continue
+		}
+		size, err := s.shards.size(iter.Value(), commitment, promiseHash)
+		if err != nil {
+			if !errors.Is(err, ErrStoreIntegrity) {
+				return 0, fmt.Errorf("stat legacy shard file: %w", err)
+			}
+			// Keep one representative error and count all invalid markers.
+			invalidEntries++
+			if integrityErr == nil {
+				integrityErr = fmt.Errorf("decoding shard marker %q: %w", iter.Key(), err)
+			}
+			continue
+		}
+		if size > math.MaxInt64-totalSize {
+			return 0, fmt.Errorf("%w: total shard size overflows int64", ErrStoreIntegrity)
+		}
+		totalSize += size
+	}
+	if err := iter.Error(); err != nil {
+		return 0, fmt.Errorf("iterating shards: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, ctx.Err()
+	}
+	if invalidEntries > 1 {
+		integrityErr = fmt.Errorf("%w (%d invalid shard metadata entries)", integrityErr, invalidEntries)
+	}
+	return totalSize, integrityErr
+}
+
+// DiskAvailable returns the free bytes on the filesystem backing the store.
+func (s *Store) DiskAvailable() (int64, error) {
+	return s.shards.diskAvailable()
+}
+
+// GetPaymentPromise retrieves a [PaymentPromise] by its hash.
+func (s *Store) GetPaymentPromise(_ context.Context, promiseHash []byte) (*PaymentPromise, error) {
+	data, closer, err := s.db.Get(promiseKey(promiseHash))
+	if err != nil {
+		return nil, fmt.Errorf("getting payment promise: %w", err)
+	}
+	defer closer.Close()
+
+	var ppProto types.PaymentPromise
+	if err := gogoproto.Unmarshal(data, &ppProto); err != nil {
+		return nil, fmt.Errorf("unmarshaling payment promise: %w", err)
+	}
+
+	var promise PaymentPromise
+	if err := promise.FromProto(&ppProto); err != nil {
+		return nil, fmt.Errorf("converting from proto: %w", err)
+	}
+
+	return &promise, nil
+}
+
+// PruneBefore deletes up to [maxPruneBatchSize] shards and payment promises that expire before the given time.
+// It returns the committed deletion count and freed bytes, retaining failed or invalid entries for retry.
+func (s *Store) PruneBefore(ctx context.Context, before time.Time) (int, int64, error) {
+	pruned, freed, _, err := s.pruneBefore(ctx, before, nil)
+	return pruned, freed, err
+}
+
+// pruneBefore resumes after the given prune-index key and returns the last scanned key for the next batch.
+// A nil returned key means the pass is complete.
+func (s *Store) pruneBefore(ctx context.Context, before time.Time, after []byte) (int, int64, []byte, error) {
+	prefix := []byte("/prune/")
+	iter, err := s.db.NewIter(&pebbledb.IterOptions{
+		LowerBound: prefix,
+		UpperBound: prefixUpperBound(prefix),
+	})
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("creating iterator: %w", err)
+	}
+	defer iter.Close()
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	var (
+		selectedBytes  int64
+		candidates     []pruneCandidate
+		pruned         int
+		prunedBytes    int64
+		integrityErr   error
+		corruptMarkers int
+		invalidKeys    int
+		lastSelected   []byte
+		scanned        int
+	)
+	beforeStr := formatTimestamp(before.UTC())
+	valid := iter.First()
+	if len(after) > 0 {
+		// When a cursor is supplied, resume at the first key after it, skipping entries attempted in the previous batch.
+		valid = iter.SeekGE(append(slices.Clone(after), 0))
+	}
+	for ; valid && scanned < maxPruneBatchSize; valid = iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return 0, 0, nil, err
+		}
+		key := iter.Key()
+		scanned++
+		lastSelected = slices.Clone(key)
+
+		keyStr := string(key)
+		pruneAt, validTime := parsePruneTime(keyStr)
+		commitment, promiseHash, ok := parsePruneKey(keyStr)
+		if !validTime || !ok {
+			if err := batch.Delete(key, pebbledb.NoSync); err != nil {
+				return 0, 0, nil, fmt.Errorf("deleting malformed prune index: %w", err)
+			}
+			invalidKeys++
+			continue
+		}
+		// Keep future payloads while scanning for malformed index entries.
+		if formatTimestamp(pruneAt) >= beforeStr {
+			continue
+		}
+
+		markerData, closer, err := s.db.Get(shardKey(commitment, promiseHash))
+		var size int64
+		switch {
+		case errors.Is(err, pebbledb.ErrNotFound):
+		case err != nil:
+			return 0, 0, nil, fmt.Errorf("getting shard marker: %w", err)
+		default:
+			// Pebble owns markerData until the closer closes.
+			markerData = slices.Clone(markerData)
+			_ = closer.Close()
+		}
+
+		size, err = s.shards.size(markerData, commitment, promiseHash)
+		if err != nil {
+			if !errors.Is(err, ErrStoreIntegrity) {
+				return 0, 0, nil, fmt.Errorf("getting shard file stats: %w", err)
+			}
+			corruptMarkers++
+			// Keep the first integrity error and count every corrupt marker.
+			if integrityErr == nil {
+				integrityErr = fmt.Errorf("decoding shard marker %q: %w", key, err)
+			}
+			continue
+		}
+		if size > math.MaxInt64-selectedBytes {
+			return 0, 0, nil, errors.New("pruned shard size overflows int64")
+		}
+		selectedBytes += size
+		candidates = append(candidates, pruneCandidate{
+			markedShard: markedShard{
+				id: shardID{commitment: commitment, promiseHash: promiseHash}, marker: markerData,
+			},
+			key: lastSelected, size: size,
+		})
+	}
+
+	if err := iter.Error(); err != nil {
+		return 0, 0, nil, fmt.Errorf("iterating prune index: %w", err)
+	}
+
+	var next []byte
+	if scanned == maxPruneBatchSize {
+		next = lastSelected
+	}
+	shards := make([]markedShard, len(candidates))
+	for i, candidate := range candidates {
+		shards[i] = candidate.markedShard
+	}
+	successful, deleteErr := s.shards.DeleteBatch(ctx, shards)
+	for _, i := range successful {
+		candidate := candidates[i]
+		if err := batch.Delete(candidate.key, pebbledb.NoSync); err != nil {
+			return 0, 0, nil, fmt.Errorf("deleting prune index: %w", err)
+		}
+		if err := batch.Delete(shardKey(candidate.id.commitment, candidate.id.promiseHash), pebbledb.NoSync); err != nil {
+			return 0, 0, nil, fmt.Errorf("deleting shard marker: %w", err)
+		}
+		if err := batch.Delete(promiseKey(candidate.id.promiseHash), pebbledb.NoSync); err != nil {
+			return 0, 0, nil, fmt.Errorf("deleting payment promise: %w", err)
+		}
+		pruned++
+		prunedBytes += candidate.size
+	}
+
+	if err := batch.Commit(pebbledb.NoSync); err != nil {
+		return 0, 0, nil, errors.Join(deleteErr, fmt.Errorf("committing batch: %w", err))
+	}
+	if invalidKeys > 0 {
+		s.log.WarnContext(ctx, "removed malformed prune index keys", "count", invalidKeys)
+	}
+	if corruptMarkers > 1 {
+		integrityErr = fmt.Errorf("%w (%d corrupt shard markers)", integrityErr, corruptMarkers)
+	}
+	if partial, ok := deleteErr.(*partialDeleteError); ok {
+		return pruned, prunedBytes, next, &partialDeleteError{err: partial.err, integrityErr: integrityErr}
+	}
+	return pruned, prunedBytes, next, errors.Join(deleteErr, integrityErr)
+}
+
+type pruneCandidate struct {
+	markedShard
+	key  []byte
+	size int64
+}
+
+// reconcile drops everything under <store>/staging/. Anything there at open
+// time is a leftover from a Put that crashed before the rename. Orphan
+// markers and orphan files in shards/ are intentionally not cleaned here:
+// markers self-heal in [Store.Get] and at pruneAt via [Store.PruneBefore];
+// rare orphan files (pebble.NoSync power loss after rename) are accepted.
+func (s *Store) reconcile() error {
+	start := time.Now()
+	stagingRemoved, err := s.shards.resetStaging()
+	if err != nil {
+		s.log.Error("store reconcile failed", "error", err, "elapsed_ms", time.Since(start).Milliseconds())
+		return err
+	}
+	s.log.Info("store reconcile complete", "staging_files_removed", stagingRemoved,
+		"elapsed_ms", time.Since(start).Milliseconds())
+	return nil
+}
+
+// Probe writes value under the reserved key /health/probe with fsync and reads
+// it back. The key lives outside the shard, promise and prune prefixes. Pebble
+// ignores ctx, so the work runs in the background and Probe gives up when ctx
+// ends. Only one probe runs at a time: while one is in flight the next waits
+// for it until ctx ends, rather than failing straight away, so a single slow
+// probe does not fail every health check that follows it.
+func (s *Store) Probe(ctx context.Context, value []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case s.probe <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	done := make(chan error, 1)
+	go func() {
+		defer func() { <-s.probe }()
+		done <- s.writeAndRead(value)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Store) writeAndRead(value []byte) error {
+	key := []byte("/health/probe")
+	if err := s.db.Set(key, value, pebbledb.Sync); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	got, closer, err := s.db.Get(key)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+	defer closer.Close()
+	if !bytes.Equal(got, value) {
+		return errors.New("read back a different value")
+	}
+	return nil
+}
+
+// Close closes the underlying pebble database. For [NewMemoryStore] the
+// in-memory FS is dropped when the Store is garbage collected. Pebble must not
+// be closed under a running operation, so Close waits briefly for a running
+// health probe. If the probe is stuck, Close returns an error and the database
+// is closed as soon as the probe returns.
+func (s *Store) Close() error {
+	select {
+	case s.probe <- struct{}{}:
+		return s.db.Close()
+	case <-time.After(probeCloseWait):
+		go func() {
+			s.probe <- struct{}{}
+			if err := s.db.Close(); err != nil {
+				s.log.Error("closing store after a stuck health probe", "error", err)
+			}
+		}()
+		return errors.New("a health probe is still running; the store closes when it returns")
+	}
+}
+
+// formatTimestamp formats t with minute precision (YYYYMMDDHHmm) for
+// lexicographic ordering in the prune index.
+func formatTimestamp(timestamp time.Time) string {
+	return timestamp.Format("200601021504")
+}
+
+func promiseKey(promiseHash []byte) []byte {
+	return fmt.Appendf(nil, "/pp/%s", hex.EncodeToString(promiseHash))
+}
+
+func shardKey(commitment Commitment, promiseHash []byte) []byte {
+	return fmt.Appendf(nil, "%s%s/%s", shardKeyPrefix, commitment.String(), hex.EncodeToString(promiseHash))
+}
+
+func parseShardKey(key string) (Commitment, []byte, bool) {
+	suffix, ok := strings.CutPrefix(key, shardKeyPrefix)
+	if !ok {
+		return Commitment{}, nil, false
+	}
+	parts := strings.Split(suffix, "/")
+	if len(parts) != 2 {
+		return Commitment{}, nil, false
+	}
+
+	commitment, err := CommitmentFromString(parts[0])
+	if err != nil {
+		return Commitment{}, nil, false
+	}
+	promiseHash, err := hex.DecodeString(parts[1])
+	if err != nil {
+		return Commitment{}, nil, false
+	}
+	return commitment, promiseHash, true
+}
+
+// pruneKey is keyed by the pruneAt computed during upload (see shardPruneAt)
+// so [Store.PruneBefore] scans in timestamp order. Re-puts of the same
+// (commit, promiseHash) are idempotent because pruneAt is deterministic given
+// CreationTimestamp, which is part of the hash.
+func pruneKey(pruneAt time.Time, commitment Commitment, promiseHash []byte) []byte {
+	return fmt.Appendf(nil, "/prune/%s/%s/%s", formatTimestamp(pruneAt.UTC()), commitment.String(), hex.EncodeToString(promiseHash))
+}
+
+// prefixUpperBound returns the upper bound for a prefix scan.
+// It increments the last byte of the prefix to create an exclusive upper bound.
+// For example, "/shard/abc" returns "/shard/abd".
+func prefixUpperBound(prefix []byte) []byte {
+	upper := make([]byte, len(prefix))
+	copy(upper, prefix)
+	for i := range slices.Backward(upper) {
+		upper[i]++
+		if upper[i] != 0 {
+			return upper
+		}
+	}
+	// all 0xff bytes - return nil to indicate no upper bound
+	return nil
+}
+
+// parsePruneKey extracts commitment and promise hash from a prune index key.
+// Key format: /prune/<timestamp>/<commitment>/<promise-hash>
+func parsePruneKey(key string) (Commitment, []byte, bool) {
+	// split: ["", "prune", "<timestamp>", "<commitment>", "<promise-hash>"]
+	parts := strings.Split(key, "/")
+	if len(parts) != 5 {
+		return Commitment{}, nil, false
+	}
+
+	commitment, err := CommitmentFromString(parts[3])
+	if err != nil {
+		return Commitment{}, nil, false
+	}
+
+	promiseHash, err := hex.DecodeString(parts[4])
+	if err != nil {
+		return Commitment{}, nil, false
+	}
+
+	return commitment, promiseHash, true
+}

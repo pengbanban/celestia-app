@@ -1,0 +1,522 @@
+package e2e_test
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/tls"
+	"fmt"
+	"log/slog"
+	"path/filepath"
+	"testing"
+	"time"
+
+	sdkmath "cosmossdk.io/math"
+	"github.com/celestiaorg/celestia-app/v11/app"
+	"github.com/celestiaorg/celestia-app/v11/app/encoding"
+	"github.com/celestiaorg/celestia-app/v11/fibre"
+	grpcfibre "github.com/celestiaorg/celestia-app/v11/fibre/internal/grpc"
+	"github.com/celestiaorg/celestia-app/v11/fibre/validator"
+	"github.com/celestiaorg/celestia-app/v11/pkg/appconsts"
+	"github.com/celestiaorg/celestia-app/v11/pkg/user"
+	"github.com/celestiaorg/celestia-app/v11/test/util/testnode"
+	fibretypes "github.com/celestiaorg/celestia-app/v11/x/fibre/types"
+	valtypes "github.com/celestiaorg/celestia-app/v11/x/valaddr/types"
+	"github.com/celestiaorg/go-square/v4/share"
+	"github.com/cometbft/cometbft/privval"
+	core "github.com/cometbft/cometbft/types"
+	"github.com/cosmos/cosmos-sdk/client/grpc/cmtservice"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+)
+
+// noEscrowKeyName is a genesis-funded account that never deposits
+// into escrow
+const noEscrowKeyName = "no-escrow-account"
+
+func TestFibreE2ETestSuite(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping fibre e2e test in short mode")
+	}
+	suite.Run(t, new(FibreE2ETestSuite))
+}
+
+type FibreE2ETestSuite struct {
+	suite.Suite
+
+	cctx testnode.Context
+
+	fibreServer  *fibre.Server
+	hostRegistry *grpcfibre.HostRegistry
+	fibreClient  *fibre.Client
+	txClient     *user.TxClient
+}
+
+func (s *FibreE2ETestSuite) SetupSuite() {
+	t := s.T()
+
+	cfg := testnode.DefaultConfig().
+		WithFundedAccounts(fibre.DefaultKeyName, noEscrowKeyName).
+		WithDelayedPrecommitTimeout(500 * time.Millisecond)
+
+	cctx, _, grpcAddr := testnode.NewNetwork(t, cfg)
+	s.cctx = cctx
+
+	_, err := s.cctx.WaitForHeight(1)
+	require.NoError(t, err, "failed to wait for first block")
+
+	// start fibre server
+	pvKeyFile := filepath.Join(s.cctx.HomeDir, "config", "priv_validator_key.json")
+	pvStateFile := filepath.Join(s.cctx.HomeDir, "data", "priv_validator_state.json")
+	filePV := privval.LoadFilePV(pvKeyFile, pvStateFile)
+
+	serverCfg := fibre.DefaultServerConfig()
+	serverCfg.AppGRPCAddress = grpcAddr
+	serverCfg.ServerListenAddress = "127.0.0.1:0"
+	serverCfg.Health.CheckInterval = "1s"
+	serverCfg.SignerFn = func(_ string) (core.PrivValidator, error) {
+		return filePV, nil
+	}
+
+	serverCfg.StoreFn = func(_ context.Context, scfg fibre.StoreConfig) (*fibre.Store, error) {
+		return fibre.NewMemoryStore(scfg), nil
+	}
+	s.fibreServer, err = fibre.NewServer(serverCfg)
+	require.NoError(t, err)
+	require.NoError(t, s.fibreServer.Start(s.cctx.GoContext()))
+
+	// create fibre client
+	s.txClient = s.newTxClient(s.cctx.GoContext(), fibre.DefaultKeyName)
+
+	s.hostRegistry = grpcfibre.NewHostRegistry(valtypes.NewQueryClient(s.cctx.GRPCClient), slog.Default())
+
+	clientCfg := fibre.DefaultClientConfig()
+	clientCfg.StateAddress = grpcAddr
+	// The single validator receives every row, so 100 MiB shard uploads exceed the default under the race detector.
+	clientCfg.RPCTimeout = 2 * time.Minute
+	// connect all validators to the single fibre server address
+	fibreAddr := s.fibreServer.ListenAddress()
+	clientCfg.NewClientFn = grpcfibre.DefaultNewClientFn(
+		&fixedHostRegistry{addr: fibreAddr},
+		func() string { return s.fibreClient.ChainID() },
+		clientCfg.MaxMessageSize,
+		nil,
+	)
+
+	s.fibreClient, err = fibre.NewClient(s.cctx.Keyring, clientCfg)
+	require.NoError(t, err)
+
+	require.NoError(t, s.fibreClient.Start(s.cctx.GoContext()))
+}
+
+func (s *FibreE2ETestSuite) TearDownSuite() {
+	if s.fibreServer != nil {
+		_ = s.fibreServer.Stop(context.Background())
+	}
+	if s.fibreClient != nil {
+		_ = s.fibreClient.Stop(context.Background())
+	}
+}
+
+func (s *FibreE2ETestSuite) Test01RegisterValidator() {
+	t := s.T()
+	ctx := s.cctx.GoContext()
+
+	// get the validator's operator address from the staking module.
+	stakingClient := stakingtypes.NewQueryClient(s.cctx.GRPCClient)
+	validatorsResp, err := stakingClient.Validators(ctx, &stakingtypes.QueryValidatorsRequest{})
+	require.NoError(t, err)
+	require.Len(t, validatorsResp.Validators, 1)
+
+	valOperatorAddr := validatorsResp.Validators[0].OperatorAddress
+	require.False(t, s.ready(), "not ready before the provider host is registered")
+
+	// submit MsgSetFibreProviderInfo to register the fibre server's gRPC address.
+	txClient, err := testnode.NewTxClientFromContext(s.cctx)
+	require.NoError(t, err)
+
+	fibreAddr := s.fibreServer.ListenAddress()
+	msg := &valtypes.MsgSetFibreProviderInfo{
+		Signer: valOperatorAddr,
+		Host:   fibreAddr,
+	}
+
+	txResp, err := txClient.SubmitTx(ctx, []sdk.Msg{msg}, user.SetGasLimit(200_000), user.SetFee(5_000))
+	require.NoError(t, err)
+	require.Equal(t, uint32(0), txResp.Code)
+	t.Logf("RegisterValidator tx included at height %d, hash: %s", txResp.Height, txResp.TxHash)
+
+	require.NoError(t, s.cctx.WaitForNextBlock())
+
+	// verify the host is now registered.
+	valAddrClient := valtypes.NewQueryClient(s.cctx.GRPCClient)
+
+	// derive the validator consensus address via the cometbft service.
+	tmServiceClient := cmtservice.NewServiceClient(s.cctx.GRPCClient)
+	valSetResp, err := tmServiceClient.GetLatestValidatorSet(ctx, &cmtservice.GetLatestValidatorSetRequest{})
+	require.NoError(t, err)
+	require.Len(t, valSetResp.Validators, 1)
+	consAddr, err := sdk.ConsAddressFromBech32(valSetResp.Validators[0].Address)
+	require.NoError(t, err)
+
+	resp, err := valAddrClient.FibreProviderInfo(ctx, &valtypes.QueryFibreProviderInfoRequest{
+		ValidatorConsensusAddress: consAddr.String(),
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Found)
+	require.Equal(t, fibreAddr, resp.Info.Host)
+
+	// refresh the host registry so the client can find the validator.
+	err = s.hostRegistry.Start(ctx)
+	require.NoError(t, err)
+
+	// the server becomes ready without a restart once the registration is on chain.
+	require.Eventually(t, s.ready, 30*time.Second, 500*time.Millisecond)
+}
+
+// ready asks the server's gRPC health service whether it is ready.
+func (s *FibreE2ETestSuite) ready() bool {
+	conn, err := grpc.NewClient(s.fibreServer.ListenAddress(), grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+		InsecureSkipVerify: true, //nolint:gosec // self-signed identity cert, as grpc_health_probe -tls-no-verify
+		MinVersion:         tls.VersionTLS13,
+	})))
+	s.Require().NoError(err)
+	defer conn.Close()
+	resp, err := healthpb.NewHealthClient(conn).Check(context.Background(), &healthpb.HealthCheckRequest{})
+	s.Require().NoError(err)
+	return resp.GetStatus() == healthpb.HealthCheckResponse_SERVING
+}
+
+func (s *FibreE2ETestSuite) Test02FundEscrowAccount() {
+	t := s.T()
+	ctx := s.cctx.GoContext()
+
+	// get client address from the keyring.
+	keyInfo, err := s.cctx.Keyring.Key(fibre.DefaultKeyName)
+	require.NoError(t, err)
+	addr, err := keyInfo.GetAddress()
+	require.NoError(t, err)
+
+	fibreQueryClient := fibretypes.NewQueryClient(s.cctx.GRPCClient)
+
+	// verify escrow account doesn't exist yet.
+	escrowResp, err := fibreQueryClient.EscrowAccount(ctx, &fibretypes.QueryEscrowAccountRequest{
+		Signer: addr.String(),
+	})
+	require.NoError(t, err)
+	require.False(t, escrowResp.Found)
+
+	txClient := s.newTxClient(ctx, fibre.DefaultKeyName)
+
+	// first deposit: 50 TIA (50_000_000 utia).
+	depositAmount := sdk.NewCoin(appconsts.BondDenom, sdkmath.NewInt(50_000_000))
+	msg := &fibretypes.MsgDepositToEscrow{
+		Signer: addr.String(),
+		Amount: depositAmount,
+	}
+	txResp, err := txClient.SubmitTx(ctx, []sdk.Msg{msg}, user.SetGasLimit(200_000), user.SetFee(5_000))
+	require.NoError(t, err)
+	require.Equal(t, uint32(0), txResp.Code)
+	t.Logf("First deposit tx at height %d", txResp.Height)
+
+	require.NoError(t, s.cctx.WaitForNextBlock())
+
+	// verify escrow balance matches deposit.
+	escrowResp, err = fibreQueryClient.EscrowAccount(ctx, &fibretypes.QueryEscrowAccountRequest{
+		Signer: addr.String(),
+	})
+	require.NoError(t, err)
+	require.True(t, escrowResp.Found)
+	require.Equal(t, depositAmount, escrowResp.EscrowAccount.Balance)
+
+	// second deposit: 25 TIA (25_000_000 utia).
+	depositAmount2 := sdk.NewCoin(appconsts.BondDenom, sdkmath.NewInt(25_000_000))
+	msg2 := &fibretypes.MsgDepositToEscrow{
+		Signer: addr.String(),
+		Amount: depositAmount2,
+	}
+	txResp, err = txClient.SubmitTx(ctx, []sdk.Msg{msg2}, user.SetGasLimit(200_000), user.SetFee(5_000))
+	require.NoError(t, err)
+	require.Equal(t, uint32(0), txResp.Code)
+	t.Logf("Second deposit tx at height %d", txResp.Height)
+
+	require.NoError(t, s.cctx.WaitForNextBlock())
+
+	// verify cumulative balance is 75 TIA.
+	escrowResp, err = fibreQueryClient.EscrowAccount(ctx, &fibretypes.QueryEscrowAccountRequest{
+		Signer: addr.String(),
+	})
+	require.NoError(t, err)
+	require.True(t, escrowResp.Found)
+	expectedBalance := sdk.NewCoin(appconsts.BondDenom, sdkmath.NewInt(75_000_000))
+	require.Equal(t, expectedBalance, escrowResp.EscrowAccount.Balance)
+}
+
+func (s *FibreE2ETestSuite) Test03Put() {
+	t := s.T()
+	ctx := s.cctx.GoContext()
+
+	// wait for a fresh block to avoid clock skew with payment promise.
+	err := s.cctx.WaitForNextBlock()
+	require.NoError(t, err)
+
+	// generate 4 KiB of random test data.
+	testData := make([]byte, 4*1024)
+	_, err = rand.Read(testData)
+	require.NoError(t, err)
+
+	ns := share.MustNewV0Namespace([]byte{0xDE, 0xAD})
+
+	result, err := fibre.Put(ctx, s.fibreClient, s.txClient, ns, testData)
+	require.NoError(t, err)
+
+	// verify Put result.
+	require.NotEmpty(t, result.BlobID.Commitment().String(), "commitment should not be empty")
+	require.NotEmpty(t, result.ValidatorSignatures, "should have validator signatures")
+	require.NotEmpty(t, result.TxHash, "tx hash should not be empty")
+	require.Greater(t, result.Height, uint64(0), "height should be positive")
+	confirmed, err := s.txClient.ConfirmTxSubscription(ctx, result.TxHash)
+	require.NoError(t, err)
+	require.Equal(t, result.Height, uint64(confirmed.Height))
+	require.Equal(t, result.TxHash, confirmed.TxHash)
+	t.Logf("Put result: commitment=%s, txHash=%s, height=%d", result.BlobID.String(), result.TxHash, result.Height)
+
+	// verify data was stored in server's store.
+	shard, err := s.fibreServer.Store().Get(ctx, result.BlobID.Commitment())
+	require.NoError(t, err)
+	require.NotNil(t, shard)
+	require.NotEmpty(t, shard.Rows, "stored shard should have rows")
+	require.NotEmpty(t, shard.GetRlcs(), "stored shard should have RLCs")
+
+	// verify the PayForFibre tx was included on chain by waiting for the block.
+	_, err = s.cctx.WaitForTx(result.TxHash, 5)
+	require.NoError(t, err)
+}
+
+func (s *FibreE2ETestSuite) Test04Download() {
+	ctx := s.cctx.GoContext()
+	reader := s.newReader(ctx, nil)
+
+	cases := []struct {
+		name string
+		ns   share.Namespace
+		size int
+	}{
+		{"SmallBlob", share.MustNewV0Namespace([]byte{0xBE, 0xEF}), 4 * 1024},
+		{"LargeBlob", share.MustNewV0Namespace([]byte{0xCA, 0xFE}), 256 * 1024},
+		{"100MiB", share.MustNewV0Namespace([]byte{0xCA, 0xFF}), 100 << 20},
+	}
+
+	for _, tc := range cases {
+		s.Run(tc.name, func() {
+			t := s.T()
+			// wait for a fresh block to avoid clock skew with the payment promise.
+			require.NoError(t, s.cctx.WaitForNextBlock())
+
+			data := make([]byte, tc.size)
+			_, err := rand.Read(data)
+			require.NoError(t, err)
+
+			before := s.escrowAccount(ctx)
+
+			result, err := fibre.Put(ctx, s.fibreClient, s.txClient, tc.ns, data)
+			require.NoError(t, err)
+
+			downloaded, err := reader.Download(ctx, result.BlobID, fibre.WithHeight(result.Height))
+			require.NoError(t, err)
+			require.NotNil(t, downloaded)
+			defer downloaded.Free()
+			require.Equal(t, data, downloaded.Data(), "downloaded blob must byte-match the submitted data")
+
+			// ConfirmTx returns once CometBFT stores the tx, which can happen before
+			// the app commits the block, so wait for the app to commit the
+			// PayForFibre height before reading the debited balance.
+			_, err = s.cctx.WaitForHeight(int64(result.Height))
+			require.NoError(t, err)
+
+			// Charged on the padded upload size the promise commits to, not len(data).
+			uploadSize := uint32(fibre.DefaultBlobConfigV0().UploadSize(len(data)))
+			wantDebit := fibretypes.PaymentAmount(uploadSize)
+			after := s.escrowAccount(ctx)
+			require.Equal(t, wantDebit, before.Balance.Sub(after.Balance),
+				"escrow Balance should drop by the payment amount")
+			require.Equal(t, wantDebit, before.AvailableBalance.Sub(after.AvailableBalance),
+				"escrow AvailableBalance should drop by the payment amount")
+			if tc.size == 100<<20 {
+				require.Equal(t, int64(74_780), wantDebit.Amount.Int64())
+				txResult, err := s.cctx.WaitForTx(result.TxHash, 5)
+				require.NoError(t, err)
+				ecfg := encoding.MakeConfig(app.ModuleEncodingRegisters...)
+				tx, err := ecfg.TxConfig.TxDecoder()(txResult.Tx)
+				require.NoError(t, err)
+				feeTx, ok := tx.(sdk.FeeTx)
+				require.True(t, ok)
+				// Include both funding transactions from Test02, at 5,000 utia each.
+				total := wantDebit.Amount.Add(feeTx.GetFee().AmountOf(appconsts.BondDenom)).AddRaw(10_000)
+				// 100 one-MiB vanilla transactions at the default gas price.
+				require.Less(t, total.Int64(), int64(3_595_500))
+				t.Logf("100 MiB: settlement=%s, PFF fee=%s, total with funding=%s utia", wantDebit, feeTx.GetFee(), total)
+			}
+		})
+	}
+}
+
+func (s *FibreE2ETestSuite) Test05InsufficientEscrow() {
+	t := s.T()
+	ctx := s.cctx.GoContext()
+	require.NoError(t, s.cctx.WaitForNextBlock())
+
+	poorClient := s.newTxClient(ctx, noEscrowKeyName)
+	signer := poorClient.DefaultAddress().String()
+	require.False(t, s.queryEscrow(ctx, signer).Found, "signer must start without an escrow account")
+
+	data := make([]byte, 4*1024)
+	_, err := rand.Read(data)
+	require.NoError(t, err)
+	ns := share.MustNewV0Namespace([]byte{0x1D, 0x1E})
+
+	_, err = fibre.Put(ctx, s.fibreClient, poorClient, ns, data)
+	require.Error(t, err, "Put must fail when the signer has no escrow to cover the payment")
+	t.Logf("insufficient-escrow Put rejected as expected: %v", err)
+
+	require.False(t, s.queryEscrow(ctx, signer).Found, "no escrow account should exist after a rejected Put")
+}
+
+func (s *FibreE2ETestSuite) Test06DownloadFailures() {
+	ctx := s.cctx.GoContext()
+
+	s.Run("NotFound", func() {
+		t := s.T()
+		var c fibre.Commitment
+		_, err := rand.Read(c[:])
+		require.NoError(t, err)
+
+		_, err = s.fibreClient.Download(ctx, fibre.NewBlobID(0, c))
+		require.Error(t, err, "download of a never-uploaded commitment must fail")
+		require.ErrorIs(t, err, fibre.ErrNotFound)
+	})
+
+	s.Run("MalformedID", func() {
+		t := s.T()
+		_, err := s.fibreClient.Download(ctx, fibre.BlobID{0x00})
+		require.Error(t, err, "download of a malformed blob ID must fail")
+		require.ErrorContains(t, err, "blob ID")
+	})
+}
+
+func (s *FibreE2ETestSuite) Test07DuplicatePayment() {
+	t := s.T()
+	ctx := s.cctx.GoContext()
+	require.NoError(t, s.cctx.WaitForNextBlock())
+
+	data := make([]byte, 4*1024)
+	_, err := rand.Read(data)
+	require.NoError(t, err)
+
+	blob, err := fibre.NewBlob(data, fibre.DefaultBlobConfigV0())
+	require.NoError(t, err)
+	defer blob.Free()
+
+	// Upload once, then drive settlement manually
+	ns := share.MustNewV0Namespace([]byte{0xAB, 0xCD})
+	signed, err := s.fibreClient.Upload(ctx, ns, blob, fibre.WithKeyName(s.txClient.DefaultAccountName()))
+	require.NoError(t, err)
+
+	promiseProto, err := signed.ToProto()
+	require.NoError(t, err)
+	msg := &fibretypes.MsgPayForFibre{
+		Signer:              s.txClient.DefaultAddress().String(),
+		PaymentPromise:      *promiseProto,
+		ValidatorSignatures: signed.ValidatorSignatures,
+	}
+
+	// The promise height comes from CometBFT, which can lead app state. Wait
+	// for the next block so the app has committed the promise height.
+	_, err = s.cctx.WaitForHeight(int64(signed.Height) + 1)
+	require.NoError(t, err)
+
+	resp, err := s.txClient.BroadcastTx(ctx, []sdk.Msg{msg})
+	require.NoError(t, err)
+	_, err = s.txClient.ConfirmTxSubscription(ctx, resp.TxHash)
+	require.NoError(t, err)
+
+	hash, err := signed.Hash()
+	require.NoError(t, err)
+	processed, err := fibretypes.NewQueryClient(s.cctx.GRPCClient).IsPaymentProcessed(ctx, &fibretypes.QueryIsPaymentProcessedRequest{PromiseHash: hash})
+	require.NoError(t, err)
+	require.True(t, processed.Found, "subscription confirmation must cover committed application state")
+
+	resp, err = s.txClient.BroadcastTx(ctx, []sdk.Msg{msg})
+	if err == nil {
+		_, err = s.txClient.ConfirmTx(ctx, resp.TxHash)
+	}
+	require.Error(t, err, "replayed PayForFibre must be rejected by the dedup guard")
+	t.Logf("duplicate PayForFibre rejected as expected: %v", err)
+}
+
+func (s *FibreE2ETestSuite) Test08PutWithoutKeyring() {
+	t := s.T()
+	ctx := s.cctx.GoContext()
+	txClient := s.newTxClient(ctx, noEscrowKeyName)
+	signer := txClient.DefaultAddress().String()
+	require.False(t, s.queryEscrow(ctx, signer).Found)
+
+	reader := s.newReader(ctx, func(cfg *fibre.ClientConfig) { cfg.Escrow.AutoFund = true })
+
+	ns := share.MustNewV0Namespace([]byte{0x0B, 0xAD})
+	result, err := fibre.Put(ctx, reader, txClient, ns, []byte("blob data"))
+	require.ErrorIs(t, err, fibre.ErrNoKeyring)
+	require.Empty(t, result)
+
+	require.False(t, s.queryEscrow(ctx, signer).Found, "a keyless Put must not fund escrow")
+}
+
+func (s *FibreE2ETestSuite) escrowAccount(ctx context.Context) *fibretypes.EscrowAccount {
+	resp := s.queryEscrow(ctx, s.txClient.DefaultAddress().String())
+	s.Require().True(resp.Found, "escrow account should exist")
+	return resp.EscrowAccount
+}
+
+// queryEscrow queries the escrow account of the given signer.
+func (s *FibreE2ETestSuite) queryEscrow(ctx context.Context, signer string) *fibretypes.QueryEscrowAccountResponse {
+	q := fibretypes.NewQueryClient(s.cctx.GRPCClient)
+	resp, err := q.EscrowAccount(ctx, &fibretypes.QueryEscrowAccountRequest{Signer: signer})
+	s.Require().NoError(err)
+	return resp
+}
+
+// newTxClient creates a tx client signing with the given key from the node's keyring.
+func (s *FibreE2ETestSuite) newTxClient(ctx context.Context, keyName string) *user.TxClient {
+	ecfg := encoding.MakeConfig(app.ModuleEncodingRegisters...)
+	txClient, err := user.SetupTxClient(ctx, s.cctx.Keyring, s.cctx.GRPCClient, ecfg, user.WithDefaultAccount(keyName))
+	s.Require().NoError(err)
+	return txClient
+}
+
+// newReader starts a keyless client from the suite client's config and stops it when the test ends.
+func (s *FibreE2ETestSuite) newReader(ctx context.Context, modify func(*fibre.ClientConfig)) *fibre.Client {
+	t := s.T()
+	cfg := s.fibreClient.Config
+	if modify != nil {
+		modify(&cfg)
+	}
+	reader, err := fibre.NewClient(nil, cfg)
+	require.NoError(t, err)
+	require.NoError(t, reader.Start(ctx))
+	t.Cleanup(func() { require.NoError(t, reader.Stop(context.Background())) })
+	return reader
+}
+
+// fixedHostRegistry returns the same address for every validator.
+type fixedHostRegistry struct{ addr string }
+
+func (r *fixedHostRegistry) GetHost(_ context.Context, _ *core.Validator) (validator.Host, error) {
+	if r.addr == "" {
+		return "", fmt.Errorf("no address configured")
+	}
+	return validator.Host(r.addr), nil
+}

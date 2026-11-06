@@ -1,0 +1,161 @@
+package abci
+
+import (
+	"bytes"
+	"encoding/csv"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/celestiaorg/celestia-app/v11/multiplexer/appd"
+	"github.com/spf13/pflag"
+)
+
+// NewVersions returns a list of versions sorted by app version.
+func NewVersions(v ...Version) (Versions, error) {
+	versions := Versions(v)
+	if err := versions.Validate(); err != nil {
+		return nil, err
+	}
+	return versions.Sorted(), nil
+}
+
+// Version defines the configuration for remote apps.
+type Version struct {
+	AppVersion  uint64
+	ABCIVersion ABCIClientVersion
+	Appd        *appd.Appd
+	PreHandlers []string // Commands to run before starting the app
+	StartArgs   []string // Extra arguments to pass to the app
+	// UnsupportedFlags are operator flags this app doesn't define, so they are
+	// not forwarded to it.
+	UnsupportedFlags map[string]struct{}
+}
+
+type Versions []Version
+
+// Sorted returns a sorted slice of Versions, sorted by AppVersion (ascending).
+func (v Versions) Sorted() Versions {
+	versionList := make(Versions, len(v))
+	copy(versionList, v)
+
+	sort.SliceStable(versionList, func(i, j int) bool {
+		return versionList[i].AppVersion < versionList[j].AppVersion
+	})
+
+	return versionList
+}
+
+// GetForAppVersion returns the version registered for exactly appVersion. It
+// returns ErrNoVersionFound for newer versions and ErrUnsupportedAppVersion
+// when no registered binary can serve appVersion.
+func (v Versions) GetForAppVersion(appVersion uint64) (Version, error) {
+	if len(v) == 0 {
+		return Version{}, fmt.Errorf("%w for app version %d: no versions registered", ErrNoVersionFound, appVersion)
+	}
+
+	for _, version := range v {
+		if version.AppVersion == appVersion {
+			return version, nil
+		}
+	}
+
+	lowest, highest := v.bounds()
+	if appVersion > highest {
+		return Version{}, fmt.Errorf("%w for app version %d: highest registered version is %d", ErrNoVersionFound, appVersion, highest)
+	}
+	return Version{}, fmt.Errorf("%w %d: registered versions are %d through %d", ErrUnsupportedAppVersion, appVersion, lowest, highest)
+}
+
+// ShouldUseLatestApp returns true if appVersion is newer than every registered
+// version and so must be served by the native (latest) app.
+func (v Versions) ShouldUseLatestApp(appVersion uint64) bool {
+	_, err := v.GetForAppVersion(appVersion)
+	return errors.Is(err, ErrNoVersionFound)
+}
+
+// GetStartArgs forwards only explicitly set, supported flags. Cobra has already
+// parsed their values, so strings such as "start" or "--otel-endpoint" cannot
+// be mistaken for subcommands or flags. Mandatory child overrides come last.
+func (v Version) GetStartArgs(flags *pflag.FlagSet) []string {
+	args := []string{}
+	if flags != nil {
+		flags.Visit(func(flag *pflag.Flag) {
+			if _, unsupported := v.UnsupportedFlags[flag.Name]; unsupported {
+				return
+			}
+			if slice, ok := flag.Value.(pflag.SliceValue); ok {
+				values := slice.GetSlice()
+				if flag.Value.Type() == "stringArray" {
+					for _, value := range values {
+						args = append(args, "--"+flag.Name+"="+value)
+					}
+					return
+				}
+				// SliceValue.String includes brackets and is not a CLI value. CSV
+				// preserves commas and quotes in stringSlice elements.
+				var value bytes.Buffer
+				writer := csv.NewWriter(&value)
+				_ = writer.Write(values)
+				writer.Flush()
+				encoded := strings.TrimSuffix(value.String(), "\n")
+				if len(values) == 1 && values[0] == "" {
+					encoded = `""` // distinguish one empty string from an empty slice
+				}
+				args = append(args, "--"+flag.Name+"="+encoded)
+				return
+			}
+			args = append(args, "--"+flag.Name+"="+flag.Value.String())
+		})
+	}
+	if len(v.StartArgs) > 0 {
+		return append(args, v.StartArgs...)
+	}
+	return append(args,
+		"--grpc.enable",
+		"--api.enable",
+		"--api.swagger=false",
+		"--with-tendermint=false",
+		"--transport=grpc",
+	)
+}
+
+// Validate checks that versions is non-empty, has no duplicate app versions,
+// and forms a contiguous range of app versions.
+func (v Versions) Validate() error {
+	if len(v) == 0 {
+		return fmt.Errorf("no versions specified")
+	}
+
+	seen := make(map[uint64]struct{}, len(v))
+	for _, ver := range v {
+		if _, exists := seen[ver.AppVersion]; exists {
+			return fmt.Errorf("version %d specified multiple times", ver.AppVersion)
+		}
+		seen[ver.AppVersion] = struct{}{}
+	}
+
+	lowest, highest := v.bounds()
+	for want := lowest; ; want++ {
+		if _, ok := seen[want]; !ok {
+			return fmt.Errorf("version %d is missing: registered app versions must be contiguous (%d through %d)", want, lowest, highest)
+		}
+		if want == highest {
+			break
+		}
+	}
+
+	return nil
+}
+
+// bounds returns the lowest and highest app version in v, which must be
+// non-empty.
+func (v Versions) bounds() (lowest, highest uint64) {
+	lowest, highest = v[0].AppVersion, v[0].AppVersion
+	for _, ver := range v[1:] {
+		lowest = min(lowest, ver.AppVersion)
+		highest = max(highest, ver.AppVersion)
+	}
+	return lowest, highest
+}

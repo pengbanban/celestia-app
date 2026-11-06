@@ -1,0 +1,31 @@
+//go:build multiplexer
+
+package embedding
+
+import _ "embed"
+
+var (
+	//go:embed celestia-app_linux_v3_arm64.tar.gz
+	v3binaryCompressed []byte
+
+	//go:embed celestia-app_linux_v4_arm64.tar.gz
+	v4binaryCompressed []byte
+
+	//go:embed celestia-app_linux_v5_arm64.tar.gz
+	v5binaryCompressed []byte
+
+	//go:embed celestia-app_linux_v6_arm64.tar.gz
+	v6binaryCompressed []byte
+
+	//go:embed celestia-app_linux_v7_arm64.tar.gz
+	v7binaryCompressed []byte
+
+	//go:embed celestia-app_linux_v8_arm64.tar.gz
+	v8binaryCompressed []byte
+
+	//go:embed celestia-app_linux_v9_arm64.tar.gz
+	v9binaryCompressed []byte
+
+	//go:embed celestia-app_linux_v10_arm64.tar.gz
+	v10binaryCompressed []byte
+)

@@ -1,0 +1,147 @@
+package cli
+
+import (
+	"fmt"
+
+	"github.com/bcp-innovations/hyperlane-cosmos/util"
+	"github.com/celestiaorg/celestia-app/v11/x/zkism/types"
+	"github.com/cosmos/cosmos-sdk/client"
+	"github.com/cosmos/cosmos-sdk/client/flags"
+	"github.com/cosmos/cosmos-sdk/version"
+	"github.com/spf13/cobra"
+)
+
+// NewQueryIsmCmd creates and returns the query command for a ZK execution ISM.
+func NewQueryIsmCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "ism [ism-id]",
+		Short:   "Query a ZK execution ISM from a given ISM identifier",
+		Long:    "Query a ZK execution Interchain Security Module (ISM) from a given ISM identifier.",
+		Example: fmt.Sprintf("%s query %s ism 0x726f757465725f69736d00000000000000000000000000000000000000000000", version.AppName, types.ModuleName),
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			clientCtx, err := client.GetClientQueryContext(cmd)
+			if err != nil {
+				return err
+			}
+
+			queryClient := types.NewQueryClient(clientCtx)
+
+			_, err = util.DecodeHexAddress(args[0])
+			if err != nil {
+				return fmt.Errorf("ism identifier is not a valid hex address")
+			}
+
+			req := &types.QueryIsmRequest{
+				Id: args[0],
+			}
+
+			res, err := queryClient.Ism(cmd.Context(), req)
+			if err != nil {
+				return err
+			}
+
+			return clientCtx.PrintProto(res)
+		},
+	}
+
+	flags.AddQueryFlagsToCmd(cmd)
+	return cmd
+}
+
+// NewQueryIsmsCmd creates and returns the query command for all ZK execution ISMs.
+func NewQueryIsmsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "isms",
+		Short:   "Query all ZK execution ISMs",
+		Long:    "Query all ZK execution Interchain Security Module (ISM).",
+		Example: fmt.Sprintf("%s query %s isms", version.AppName, types.ModuleName),
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			clientCtx, err := client.GetClientQueryContext(cmd)
+			if err != nil {
+				return err
+			}
+
+			queryClient := types.NewQueryClient(clientCtx)
+
+			pageReq, err := client.ReadPageRequest(cmd.Flags())
+			if err != nil {
+				return err
+			}
+
+			req := &types.QueryIsmsRequest{
+				Pagination: pageReq,
+			}
+
+			res, err := queryClient.Isms(cmd.Context(), req)
+			if err != nil {
+				return err
+			}
+
+			return clientCtx.PrintProto(res)
+		},
+	}
+
+	flags.AddQueryFlagsToCmd(cmd)
+	flags.AddPaginationFlagsToCmd(cmd, "isms")
+	return cmd
+}
+
+// NewQueryMerkleTreeStateCmd creates and returns the query command for the proven source chain merkle tree state.
+func NewQueryMerkleTreeStateCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "merkle-tree-state [ism-id]",
+		Short:   "Query the proven source chain merkle tree state",
+		Long:    "Query the source chain merkle tree root and leaf count most recently proven for a given ISM. Messages are verified against this root.",
+		Example: fmt.Sprintf("%s query %s merkle-tree-state 0x726f757465725f69736d000000000000000000000000002a0000000000000000", version.AppName, types.ModuleName),
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			clientCtx, err := client.GetClientQueryContext(cmd)
+			if err != nil {
+				return err
+			}
+
+			queryClient := types.NewQueryClient(clientCtx)
+
+			res, err := queryClient.MerkleTreeState(cmd.Context(), &types.QueryMerkleTreeStateRequest{Id: args[0]})
+			if err != nil {
+				return err
+			}
+
+			return clientCtx.PrintProto(res)
+		},
+	}
+
+	flags.AddQueryFlagsToCmd(cmd)
+	return cmd
+}
+
+// NewQueryRootHistoryCmd creates and returns the query cmd for the root history of an ism.
+func NewQueryRootHistoryCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "root-history [ism-id]",
+		Short:   "Query the replaced state roots and merkle tree states an ISM still accepts",
+		Long:    "Query the root history size of a given ISM and the replaced state roots and merkle tree states it keeps, oldest first. Membership proofs may target any kept state root and messages may be relayed with merkle proofs against any kept tree root.",
+		Example: fmt.Sprintf("%s query %s root-history 0x726f757465725f69736d000000000000000000000000002a0000000000000000", version.AppName, types.ModuleName),
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			clientCtx, err := client.GetClientQueryContext(cmd)
+			if err != nil {
+				return err
+			}
+
+			queryClient := types.NewQueryClient(clientCtx)
+
+			res, err := queryClient.RootHistory(cmd.Context(), &types.QueryRootHistoryRequest{Id: args[0]})
+			if err != nil {
+				return err
+			}
+
+			return clientCtx.PrintProto(res)
+		},
+	}
+
+	flags.AddQueryFlagsToCmd(cmd)
+	return cmd
+}

@@ -1,0 +1,130 @@
+package validator
+
+import (
+	"fmt"
+	"sync"
+
+	cmtmath "github.com/cometbft/cometbft/libs/math"
+	core "github.com/cometbft/cometbft/types"
+)
+
+// SignatureSet collects and validates signatures from validators.
+// It is safe for concurrent use.
+// Signatures are returned in validator set order by [Signatures],
+// with nil entries for validators that did not sign.
+type SignatureSet struct {
+	// requiredBytesSigned is the message each validator's signature is verified
+	// against, under ZIP-215.
+	requiredBytesSigned    []byte
+	minRequiredVotingPower int64
+	validators             []*core.Validator
+
+	mu          sync.Mutex
+	votingPower int64
+	signatures  map[string][]byte
+}
+
+// MinRequiredVotingPower returns the voting power a [SignatureSet] over this
+// set must collect to reach targetVotingPower.
+func (s Set) MinRequiredVotingPower(targetVotingPower cmtmath.Fraction) int64 {
+	return s.TotalVotingPower() * int64(targetVotingPower.Numerator) / int64(targetVotingPower.Denominator)
+}
+
+// NewSignatureSet creates a new [SignatureSet] for collecting and validating signatures.
+func (s Set) NewSignatureSet(targetVotingPower cmtmath.Fraction, requiredBytesSigned []byte) *SignatureSet {
+	return &SignatureSet{
+		requiredBytesSigned:    requiredBytesSigned,
+		minRequiredVotingPower: s.MinRequiredVotingPower(targetVotingPower),
+		validators:             s.Validators,
+		signatures:             make(map[string][]byte, s.Size()),
+	}
+}
+
+// QuorumPrefix returns how many leading entries of signatures a sequential
+// [SignatureSet.Add] walk inspects before reaching minRequiredVotingPower, and
+// whether that power is reached at all. The walk stops as soon as the threshold
+// is met, so entries past the prefix are never verified and a parallel verifier
+// must not inspect them either.
+//
+// signatures is positional over validators and must not be longer than it.
+func QuorumPrefix(validators []*core.Validator, signatures [][]byte, minRequiredVotingPower int64) (prefix int, quorumMet bool) {
+	var votingPower int64
+	for i, signature := range signatures {
+		if len(signature) == 0 {
+			continue
+		}
+		votingPower += validators[i].VotingPower
+		if votingPower >= minRequiredVotingPower {
+			return i + 1, true
+		}
+	}
+	return len(signatures), votingPower >= minRequiredVotingPower
+}
+
+// Add validates and adds a signature from the given validator.
+// Returns an error if the signature is invalid.
+// Returns true if enough signatures have been collected to meet both thresholds.
+//
+// Verification applies ZIP-215, which accepts strictly more signatures than
+// crypto/ed25519 did. See fibre/validator/zip215_test.go.
+func (ss *SignatureSet) Add(val *core.Validator, signature []byte) (bool, error) {
+	// verify signature
+	if !val.PubKey.VerifySignature(ss.requiredBytesSigned, signature) {
+		return false, fmt.Errorf("invalid signature from validator %s", val.Address.String())
+	}
+
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+
+	// if this validator already signed, treat as a no-op to avoid
+	// double-counting voting power.
+	addr := val.Address.String()
+	if _, ok := ss.signatures[addr]; ok {
+		return ss.votingPower >= ss.minRequiredVotingPower, nil
+	}
+
+	// add to collection
+	ss.votingPower += val.VotingPower
+	ss.signatures[addr] = signature
+
+	// check if thresholds are met
+	return ss.votingPower >= ss.minRequiredVotingPower, nil
+}
+
+// Signatures returns collected signatures ordered by validator set position if thresholds are met.
+// Validators that did not sign have nil entries.
+// Returns [NotEnoughSignaturesError] if voting power threshold is not met.
+// The error contains the partially collected signatures and threshold information.
+func (ss *SignatureSet) Signatures() ([][]byte, error) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+
+	ordered := make([][]byte, len(ss.validators))
+	for i, val := range ss.validators {
+		if sig, ok := ss.signatures[val.Address.String()]; ok {
+			ordered[i] = sig
+		}
+	}
+
+	if ss.votingPower < ss.minRequiredVotingPower {
+		return nil, &NotEnoughSignaturesError{
+			Collected:      ordered,
+			CollectedPower: ss.votingPower,
+			RequiredPower:  ss.minRequiredVotingPower,
+		}
+	}
+
+	return ordered, nil
+}
+
+// NotEnoughSignaturesError indicates that signature collection did not meet the required thresholds.
+// It contains the partially collected signatures and threshold information.
+type NotEnoughSignaturesError struct {
+	Collected      [][]byte
+	CollectedPower int64
+	RequiredPower  int64
+}
+
+func (e *NotEnoughSignaturesError) Error() string {
+	return fmt.Sprintf("not enough voting power: collected %d, required %d", e.CollectedPower, e.RequiredPower)
+}

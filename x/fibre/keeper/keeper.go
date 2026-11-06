@@ -1,0 +1,573 @@
+package keeper
+
+import (
+	"encoding/binary"
+	"fmt"
+	"time"
+
+	"cosmossdk.io/log"
+	"cosmossdk.io/math"
+	storetypes "cosmossdk.io/store/types"
+	"github.com/celestiaorg/celestia-app/v11/fibre"
+	"github.com/celestiaorg/celestia-app/v11/pkg/sigcache"
+	"github.com/celestiaorg/celestia-app/v11/x/fibre/types"
+	"github.com/cosmos/cosmos-sdk/codec"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	lru "github.com/hashicorp/golang-lru/v2"
+)
+
+// Keeper handles all the state changes for the fibre module.
+type Keeper struct {
+	cdc           codec.Codec
+	storeKey      storetypes.StoreKey
+	bankKeeper    types.BankKeeper
+	stakingKeeper types.StakingKeeper
+	// authority is the address that has the authority to update module parameters.
+	// This is typically the governance module address.
+	authority string
+	// promiseCache, when non-nil, reserves escrow budget for accepted promises on
+	// the ValidatePaymentPromise query path to close the validator-local
+	// double-spend window. It is nil in consensus-only setups and unit tests and
+	// is never consulted from the ABCI path. See local_promise_cache.go.
+	promiseCache *LocalPromiseCache
+	// sigCache memoizes promise signature verification. A nil cache disables
+	// memoization; the verification itself is unchanged either way.
+	sigCache SigCache
+	// valSetCache memoizes the validator set conversion per height.
+	valSetCache *lru.Cache[int64, *convertedValidatorSet]
+}
+
+// SigCache remembers signatures that already verified successfully.
+type SigCache interface {
+	Has(key sigcache.Key) bool
+	Add(key sigcache.Key)
+}
+
+// NewKeeper creates a new fibre Keeper instance. When enableCache is true the
+// validator-local promise cache is attached here, so the field is set before the
+// keeper is ever copied by value (e.g. into the module's gRPC query server); this
+// keeps the double-spend protection from silently depending on call order. The
+// cache is a non-consensus, query-path-only dependency and is never consulted from
+// the ABCI path.
+func NewKeeper(cdc codec.Codec, storeKey storetypes.StoreKey, bankKeeper types.BankKeeper, stakingKeeper types.StakingKeeper, authority string, enableCache bool, sigCache SigCache) *Keeper {
+	k := &Keeper{
+		cdc:           cdc,
+		storeKey:      storeKey,
+		bankKeeper:    bankKeeper,
+		stakingKeeper: stakingKeeper,
+		authority:     authority,
+		sigCache:      sigCache,
+		valSetCache:   newValidatorSetCache(),
+	}
+	if enableCache {
+		k.promiseCache = NewLocalPromiseCache(k)
+	}
+	return k
+}
+
+// GetAuthority returns the fibre module's authority.
+func (k Keeper) GetAuthority() string {
+	return k.authority
+}
+
+// Logger returns a x/fibre specific logger.
+func (k Keeper) Logger(ctx sdk.Context) log.Logger {
+	return ctx.Logger().With("module", fmt.Sprintf("x/%s", types.ModuleName))
+}
+
+// GetParams returns the x/fibre module's parameters.
+func (k Keeper) GetParams(ctx sdk.Context) types.Params {
+	store := ctx.KVStore(k.storeKey)
+	bz := store.Get([]byte(types.ParamsKey))
+	if len(bz) == 0 {
+		return types.DefaultParams()
+	}
+
+	var params types.Params
+	k.cdc.MustUnmarshal(bz, &params)
+	return params
+}
+
+// SetParams sets the params
+func (k Keeper) SetParams(ctx sdk.Context, params types.Params) {
+	store := ctx.KVStore(k.storeKey)
+	bz := k.cdc.MustMarshal(&params)
+	store.Set([]byte(types.ParamsKey), bz)
+}
+
+// GetPromiseFreshnessFloor returns the freshness floor: the oldest creation_timestamp
+// still accepted, tracked as the highest block_time - WithdrawalDelay seen so far.
+// A zero time means it has not been set yet (a fresh chain, before the first block) and
+// imposes no lower bound. A non-nil error means the stored value could not be decoded.
+func (k Keeper) GetPromiseFreshnessFloor(ctx sdk.Context) (time.Time, error) {
+	store := ctx.KVStore(k.storeKey)
+	bz := store.Get(types.PromiseFreshnessFloorKey)
+	if len(bz) == 0 {
+		return time.Time{}, nil
+	}
+	floor, err := sdk.ParseTimeBytes(bz)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to parse promise freshness floor: %w", err)
+	}
+	return floor, nil
+}
+
+// SetPromiseFreshnessFloor persists the payment-promise freshness floor.
+func (k Keeper) SetPromiseFreshnessFloor(ctx sdk.Context, floor time.Time) {
+	store := ctx.KVStore(k.storeKey)
+	store.Set(types.PromiseFreshnessFloorKey, sdk.FormatTimeBytes(floor))
+}
+
+// getGenesisHeight returns the height of the first block, or 0 if InitGenesis predates
+// recording it. The read is not charged so every verification path costs the same gas.
+func (k Keeper) getGenesisHeight(ctx sdk.Context) int64 {
+	store := ctx.WithGasMeter(storetypes.NewInfiniteGasMeter()).KVStore(k.storeKey)
+	bz := store.Get(types.GenesisHeightKey)
+	if len(bz) != 8 {
+		return 0
+	}
+	return int64(binary.BigEndian.Uint64(bz))
+}
+
+// setGenesisHeight records the height of the first block.
+func (k Keeper) setGenesisHeight(ctx sdk.Context, height int64) {
+	ctx.KVStore(k.storeKey).Set(types.GenesisHeightKey, binary.BigEndian.AppendUint64(nil, uint64(height)))
+}
+
+// GetEscrowAccount retrieves an escrow account by signer address.
+func (k Keeper) GetEscrowAccount(ctx sdk.Context, signer string) (account types.EscrowAccount, isFound bool) {
+	store := ctx.KVStore(k.storeKey)
+	key := types.EscrowAccountKey(signer)
+	bz := store.Get(key)
+	if bz == nil {
+		return types.EscrowAccount{}, false
+	}
+
+	k.cdc.MustUnmarshal(bz, &account)
+	return account, true
+}
+
+// SetEscrowAccount stores an escrow account
+func (k Keeper) SetEscrowAccount(ctx sdk.Context, account types.EscrowAccount) {
+	store := ctx.KVStore(k.storeKey)
+	key := types.EscrowAccountKey(account.Signer)
+	bz := k.cdc.MustMarshal(&account)
+	store.Set(key, bz)
+}
+
+// DeleteEscrowAccount removes an escrow account from the store
+func (k Keeper) DeleteEscrowAccount(ctx sdk.Context, signer string) {
+	store := ctx.KVStore(k.storeKey)
+	key := types.EscrowAccountKey(signer)
+	store.Delete(key)
+}
+
+// GetWithdrawal retrieves a withdrawal by signer and timestamp
+func (k Keeper) GetWithdrawal(ctx sdk.Context, signer string, requestedTimestamp time.Time) (withdrawal types.Withdrawal, isFound bool) {
+	store := ctx.KVStore(k.storeKey)
+	key := types.WithdrawalsBySignerKey(signer, requestedTimestamp)
+	bz := store.Get(key)
+	if bz == nil {
+		return types.Withdrawal{}, false
+	}
+
+	k.cdc.MustUnmarshal(bz, &withdrawal)
+	return withdrawal, true
+}
+
+// SetWithdrawal saves a withdrawal to both indexes:
+// 1. Primary index: withdrawals_by_signer/{signer}/{requested_timestamp}
+// 2. Secondary index: withdrawals_by_available/{available_timestamp}/{requested_timestamp}/{signer}
+func (k Keeper) SetWithdrawal(ctx sdk.Context, withdrawal types.Withdrawal) {
+	store := ctx.KVStore(k.storeKey)
+	bz := k.cdc.MustMarshal(&withdrawal)
+
+	// Store in primary index
+	primaryKey := types.WithdrawalsBySignerKey(withdrawal.Signer, withdrawal.RequestedTimestamp)
+	store.Set(primaryKey, bz)
+
+	// Store in secondary index
+	secondaryKey := types.WithdrawalsByAvailableKey(withdrawal.AvailableTimestamp, withdrawal.RequestedTimestamp, withdrawal.Signer)
+	store.Set(secondaryKey, bz)
+}
+
+// DeleteWithdrawal removes a withdrawal from both indexes.
+// This should be called when a withdrawal is processed or cancelled.
+func (k Keeper) DeleteWithdrawal(ctx sdk.Context, withdrawal types.Withdrawal) {
+	store := ctx.KVStore(k.storeKey)
+
+	// Delete from primary index
+	primaryKey := types.WithdrawalsBySignerKey(withdrawal.Signer, withdrawal.RequestedTimestamp)
+	store.Delete(primaryKey)
+
+	// Delete from secondary index
+	secondaryKey := types.WithdrawalsByAvailableKey(withdrawal.AvailableTimestamp, withdrawal.RequestedTimestamp, withdrawal.Signer)
+	store.Delete(secondaryKey)
+}
+
+// GetWithdrawalsBySigner retrieves all withdrawals for a signer
+func (k Keeper) GetWithdrawalsBySigner(ctx sdk.Context, signer string) []types.Withdrawal {
+	store := ctx.KVStore(k.storeKey)
+	prefix := types.WithdrawalsBySignerPrefix(signer)
+	iterator := storetypes.KVStorePrefixIterator(store, prefix)
+	defer iterator.Close()
+
+	var withdrawals []types.Withdrawal
+	for ; iterator.Valid(); iterator.Next() {
+		var withdrawal types.Withdrawal
+		k.cdc.MustUnmarshal(iterator.Value(), &withdrawal)
+		withdrawals = append(withdrawals, withdrawal)
+	}
+
+	return withdrawals
+}
+
+// GetWithdrawalsByAvailableIterator returns an iterator for all withdrawals available up to the given time
+func (k Keeper) GetWithdrawalsByAvailableIterator(ctx sdk.Context, upToTime time.Time) storetypes.Iterator {
+	store := ctx.KVStore(k.storeKey)
+	// Start from the beginning of the withdrawals-by-available index
+	start := types.WithdrawalsByAvailableKeyPrefix
+	// End at the last possible key for the given time
+	end := storetypes.PrefixEndBytes(types.WithdrawalsByAvailablePrefix(upToTime))
+	return store.Iterator(start, end)
+}
+
+// ParseWithdrawalsByAvailableKey parses available_at, requested_at, and signer from the key.
+// Key layout: 0x04 || available || "/" || requested || "/" || signer
+func (k Keeper) ParseWithdrawalsByAvailableKey(key []byte) (available, requested time.Time, signer string, err error) {
+	// Remove the prefix
+	if len(key) < len(types.WithdrawalsByAvailableKeyPrefix) {
+		return time.Time{}, time.Time{}, "", fmt.Errorf("key too short for prefix")
+	}
+	key = key[len(types.WithdrawalsByAvailableKeyPrefix):]
+
+	// Parse available timestamp (first 29 bytes as per SDK's FormatTimeBytes)
+	if len(key) < 29 {
+		return time.Time{}, time.Time{}, "", fmt.Errorf("key too short for available timestamp")
+	}
+	available, err = sdk.ParseTimeBytes(key[:29])
+	if err != nil {
+		return time.Time{}, time.Time{}, "", fmt.Errorf("failed to parse available timestamp: %w", err)
+	}
+
+	// Skip the separator "/"
+	key = key[29:]
+	if len(key) > 0 && key[0] == '/' {
+		key = key[1:]
+	}
+
+	// Parse requested timestamp (next 29 bytes)
+	if len(key) < 29 {
+		return time.Time{}, time.Time{}, "", fmt.Errorf("key too short for requested timestamp")
+	}
+	requested, err = sdk.ParseTimeBytes(key[:29])
+	if err != nil {
+		return time.Time{}, time.Time{}, "", fmt.Errorf("failed to parse requested timestamp: %w", err)
+	}
+
+	// Skip the separator "/"
+	key = key[29:]
+	if len(key) > 0 && key[0] == '/' {
+		key = key[1:]
+	}
+
+	signer = string(key)
+	return available, requested, signer, nil
+}
+
+// GetProcessedPayment retrieves a processed payment by promiseHash
+func (k Keeper) GetProcessedPayment(ctx sdk.Context, promiseHash []byte) (payment types.ProcessedPayment, isFound bool) {
+	store := ctx.KVStore(k.storeKey)
+	key := types.ProcessedPaymentsByHashKey(promiseHash)
+	bz := store.Get(key)
+	if bz == nil {
+		return types.ProcessedPayment{}, false
+	}
+	k.cdc.MustUnmarshal(bz, &payment)
+	return payment, true
+}
+
+// SetProcessedPayment saves a processed payment to both indexes:
+// 1. Primary index: processed_payments_by_hash/{hash}
+// 2. Secondary index: processed_payments_by_time/{processed_at}/{hash}
+func (k Keeper) SetProcessedPayment(ctx sdk.Context, payment types.ProcessedPayment) {
+	store := ctx.KVStore(k.storeKey)
+	bz := k.cdc.MustMarshal(&payment)
+
+	// Store in primary index (by hash)
+	primaryKey := types.ProcessedPaymentsByHashKey(payment.PaymentPromiseHash)
+	store.Set(primaryKey, bz)
+
+	// Store in secondary index (by time)
+	secondaryKey := types.ProcessedPaymentsByTimeKey(payment.ProcessedAt, payment.PaymentPromiseHash)
+	store.Set(secondaryKey, bz)
+}
+
+// DeleteProcessedPayment removes a processed payment from both indexes.
+// This should be called when pruning old processed payments.
+func (k Keeper) DeleteProcessedPayment(ctx sdk.Context, payment types.ProcessedPayment) {
+	store := ctx.KVStore(k.storeKey)
+
+	// Delete from primary index
+	primaryKey := types.ProcessedPaymentsByHashKey(payment.PaymentPromiseHash)
+	store.Delete(primaryKey)
+
+	// Delete from secondary index
+	secondaryKey := types.ProcessedPaymentsByTimeKey(payment.ProcessedAt, payment.PaymentPromiseHash)
+	store.Delete(secondaryKey)
+}
+
+// IsPaymentPromiseProcessed returns true if a payment has been processed for the given promise.
+func (k Keeper) IsPaymentPromiseProcessed(ctx sdk.Context, promise *types.PaymentPromise) bool {
+	hash, err := promiseHash(promise)
+	if err != nil {
+		return false
+	}
+	return k.IsPaymentProcessedByHash(ctx, hash)
+}
+
+// promiseHash returns the canonical hash of a payment promise.
+func promiseHash(promise *types.PaymentPromise) ([]byte, error) {
+	pp := fibre.PaymentPromise{}
+	if err := pp.FromProto(promise); err != nil {
+		return nil, err
+	}
+	return pp.Hash()
+}
+
+// IsPaymentProcessedByHash returns true if a payment has been processed for the given promise hash.
+func (k Keeper) IsPaymentProcessedByHash(ctx sdk.Context, promiseHash []byte) bool {
+	store := ctx.KVStore(k.storeKey)
+	key := types.ProcessedPaymentsByHashKey(promiseHash)
+	return store.Has(key)
+}
+
+// ValidatePromiseStateless runs pp.Validate, skipping it when an identical
+// promise was already recorded. Validate is a pure function of the promise, so
+// a hit can only skip a check that would have succeeded.
+//
+// A pass is not recorded here. The promise signature is the submitter's own,
+// so it verifies by construction; what makes an entry legitimate is the
+// message around it passing every check it still faces. Callers record with
+// recordVerifiedPromise once that is settled, so a rejected message buys no
+// entry and cannot evict the entries of accepted ones.
+func (k Keeper) ValidatePromiseStateless(pp *fibre.PaymentPromise) error {
+	if key, keyed := promiseSigCacheKey(pp); keyed && k.sigCache != nil && k.sigCache.Has(key) {
+		return nil
+	}
+	return pp.Validate()
+}
+
+// recordVerifiedPromise records pp as verified. Call it only after pp passed
+// ValidatePromiseStateless and the message carrying it passed every other
+// check, so that nothing a node will reject can take up cache space.
+func (k Keeper) recordVerifiedPromise(pp *fibre.PaymentPromise) {
+	if k.sigCache == nil {
+		return
+	}
+	if key, keyed := promiseSigCacheKey(pp); keyed {
+		k.sigCache.Add(key)
+	}
+}
+
+// promiseSigCacheKey covers every input to pp.Validate: the signer key, the sign
+// bytes (which encode all the validated fields) and the signature. It reports
+// false when the promise is too malformed to key, leaving Validate to report it.
+func promiseSigCacheKey(pp *fibre.PaymentPromise) (sigcache.Key, bool) {
+	if pp.SignerKey == nil {
+		return sigcache.Key{}, false
+	}
+	signBytes, err := pp.SignBytes()
+	if err != nil {
+		return sigcache.Key{}, false
+	}
+	return promiseSigCacheKeyFromSignBytes(pp, signBytes), true
+}
+
+func promiseSigCacheKeyFromSignBytes(pp *fibre.PaymentPromise, signBytes []byte) sigcache.Key {
+	return sigcache.NewKey(sigcache.PromiseSignature, pp.SignerKey.Bytes(), signBytes, pp.Signature)
+}
+
+// GetProcessedPaymentsByTimeIterator returns an iterator for all processed payments up to the given time
+func (k Keeper) GetProcessedPaymentsByTimeIterator(ctx sdk.Context, upToTime time.Time) storetypes.Iterator {
+	store := ctx.KVStore(k.storeKey)
+	// Start from the beginning of the processed-payments-by-time index
+	start := types.ProcessedPaymentsByTimeKeyPrefix
+	// End at the last possible key for the given time
+	end := storetypes.PrefixEndBytes(types.ProcessedPaymentsByTimePrefix(upToTime))
+	return store.Iterator(start, end)
+}
+
+// ParseProcessedPaymentsByTimeKey parses the processed_at timestamp and payment promise hash from the key
+func (k Keeper) ParseProcessedPaymentsByTimeKey(key []byte) (processedAt time.Time, paymentPromiseHash []byte, err error) {
+	// Remove the prefix
+	if len(key) < len(types.ProcessedPaymentsByTimeKeyPrefix) {
+		return time.Time{}, nil, fmt.Errorf("key too short for prefix")
+	}
+	key = key[len(types.ProcessedPaymentsByTimeKeyPrefix):]
+
+	// Parse the timestamp (first 29 bytes as per SDK's FormatTimeBytes)
+	if len(key) < 29 {
+		return time.Time{}, nil, fmt.Errorf("key too short for timestamp")
+	}
+	timestampBytes := key[:29]
+
+	processedAt, err = sdk.ParseTimeBytes(timestampBytes)
+	if err != nil {
+		return time.Time{}, nil, fmt.Errorf("failed to parse timestamp: %w", err)
+	}
+
+	// Skip the separator "/"
+	key = key[29:]
+	if len(key) > 0 && key[0] == '/' {
+		key = key[1:]
+	}
+
+	// The rest is the payment promise hash
+	paymentPromiseHash = key
+	return processedAt, paymentPromiseHash, nil
+}
+
+// validatePaymentPromiseStatefulInternal performs the core stateful validation logic.
+// The isTimeout parameter indicates whether this is being called for timeout processing,
+// which skips expiration and height validation to allow processing older promises.
+func (k Keeper) validatePaymentPromiseStatefulInternal(ctx sdk.Context, promise *types.PaymentPromise, isTimeout bool) (time.Time, error) {
+	if promise.ChainId != ctx.ChainID() {
+		return time.Time{}, fmt.Errorf("payment promise chain_id %q does not match executing chain %q", promise.ChainId, ctx.ChainID())
+	}
+
+	params := k.GetParams(ctx)
+	currentTime := ctx.BlockTime()
+	creationTime := promise.CreationTimestamp
+
+	// A promise is only fresh if it was created after the cutoff. Normally the cutoff is
+	// current_time - withdrawal_delay, but we never let it slide further back than the
+	// freshness floor.
+	//
+	// Here is why the floor is needed. After a promise settles we keep a record of it for
+	// the retention window and then prune it. If governance later raises withdrawal_delay
+	// (say from 1h to 48h), the plain cutoff current_time - withdrawal_delay jumps ~47h
+	// further into the past, so a long-since-pruned promise looks fresh again - and with
+	// its record gone, nothing stops it from settling a second time. The floor only ever
+	// moves forward, so a larger withdrawal_delay can no longer reopen that gap (#7606).
+	minAllowedTime := currentTime.Add(-params.WithdrawalDelay)
+	floor, err := k.GetPromiseFreshnessFloor(ctx)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if floor.After(minAllowedTime) {
+		minAllowedTime = floor
+	}
+	if !creationTime.After(minAllowedTime) {
+		return time.Time{}, fmt.Errorf("creation_timestamp %v is too old; it must be after the freshness cutoff %v", creationTime, minAllowedTime)
+	}
+
+	// Reject a future-dated creation_timestamp (beyond clock skew) on both paths;
+	// see types.MaxPromiseClockSkew for why.
+	maxAllowedTime := currentTime.Add(types.MaxPromiseClockSkew)
+	if creationTime.After(maxAllowedTime) {
+		return time.Time{}, fmt.Errorf("creation_timestamp %v must not be after %v (current_time + max_clock_skew)", creationTime, maxAllowedTime)
+	}
+
+	expirationTime := creationTime.Add(params.PaymentPromiseTimeout)
+	// Expiration time validation only applies to normal flow (not timeout mechanism)
+	if !isTimeout {
+		if currentTime.After(expirationTime) || currentTime.Equal(expirationTime) {
+			return time.Time{}, fmt.Errorf("payment promise expired: creation_timestamp %v + timeout %v = %v, current_time: %v", creationTime, params.PaymentPromiseTimeout, expirationTime, currentTime)
+		}
+	}
+
+	// Height validation only applies to normal flow (not timeout mechanism)
+	if !isTimeout {
+		currentHeight := ctx.BlockHeight()
+		promiseHeight := promise.Height
+
+		// Validate height is not too far in the past
+		if currentHeight-promiseHeight > int64(params.PaymentPromiseHeightWindow) {
+			return time.Time{}, fmt.Errorf("payment promise height %d is too far in the past (current height: %d, max window: %d)", promiseHeight, currentHeight, params.PaymentPromiseHeightWindow)
+		}
+
+		// Validate height is not too far in the future (allow up to 1 block ahead)
+		if promiseHeight > currentHeight+1 {
+			return time.Time{}, fmt.Errorf("payment promise height %d is too far in the future (current height: %d, max allowed: %d)", promiseHeight, currentHeight, currentHeight+1)
+		}
+	}
+
+	// Check if payment promise has already been processed
+	if isAlreadyProcessed := k.IsPaymentPromiseProcessed(ctx, promise); isAlreadyProcessed {
+		return time.Time{}, fmt.Errorf("payment promise has already been processed")
+	}
+
+	// Check escrow account exists
+	signerAddr := sdk.AccAddress(promise.SignerPublicKey.Address())
+	signerAddrStr := signerAddr.String()
+	escrowAccount, found := k.GetEscrowAccount(ctx, signerAddrStr)
+	if !found {
+		return time.Time{}, fmt.Errorf("escrow account not found for signer %v", signerAddrStr)
+	}
+
+	// Check sufficient balance (includes funds locked in pending withdrawals)
+	requiredAmount := types.PaymentAmount(promise.BlobSize)
+
+	hasSufficientBalance := escrowAccount.Balance.IsGTE(requiredAmount)
+	if !hasSufficientBalance {
+		return time.Time{}, fmt.Errorf("insufficient balance in escrow account. required: %v, balance: %v", requiredAmount, escrowAccount.Balance)
+	}
+
+	return expirationTime, nil
+}
+
+// ValidatePaymentPromiseStateful performs stateful validation of a payment promise.
+//
+// This method does NOT perform stateless validation.
+// Callers should perform stateless validation separately via pp.Validate().
+//
+// Returns the expiration time if validation succeeds.
+func (k Keeper) ValidatePaymentPromiseStateful(ctx sdk.Context, promise *types.PaymentPromise) (time.Time, error) {
+	isTimeout := false
+	return k.validatePaymentPromiseStatefulInternal(ctx, promise, isTimeout)
+}
+
+// ValidatePaymentPromiseStatefulForTimeout performs stateful validation of a payment promise for timeout processing.
+// It performs the same checks as ValidatePaymentPromiseStateful except it skips expiration and height validation
+// to allow processing older promises that may be outside the normal validation windows.
+//
+// This method does NOT perform stateless validation.
+// Callers should perform stateless validation separately via pp.Validate().
+//
+// Returns the expiration time if validation succeeds.
+func (k Keeper) ValidatePaymentPromiseStatefulForTimeout(ctx sdk.Context, promise *types.PaymentPromise) (time.Time, error) {
+	isTimeout := true
+	return k.validatePaymentPromiseStatefulInternal(ctx, promise, isTimeout)
+}
+
+// ReduceWithdrawalsForPayment reduces pending withdrawal amounts for a signer by the given shortfall.
+// It iterates withdrawals in order (oldest first) and either partially reduces a withdrawal's
+// amount or fully consumes (deletes) it.
+// Precondition: expects the escrow.Balance >= remaining. Otherwise, returns an error.
+func (k Keeper) ReduceWithdrawalsForPayment(ctx sdk.Context, signer string, remaining sdk.Coin) error {
+	store := ctx.KVStore(k.storeKey)
+	prefix := types.WithdrawalsBySignerPrefix(signer)
+	iterator := storetypes.KVStorePrefixIterator(store, prefix)
+	defer iterator.Close()
+
+	for ; iterator.Valid() && remaining.IsPositive(); iterator.Next() {
+		var withdrawal types.Withdrawal
+		k.cdc.MustUnmarshal(iterator.Value(), &withdrawal)
+
+		if remaining.IsGTE(withdrawal.Amount) {
+			remaining = remaining.Sub(withdrawal.Amount)
+			k.DeleteWithdrawal(ctx, withdrawal)
+		} else {
+			withdrawal.Amount = withdrawal.Amount.Sub(remaining)
+			k.SetWithdrawal(ctx, withdrawal)
+			remaining = sdk.NewCoin(remaining.Denom, math.ZeroInt())
+		}
+	}
+
+	if remaining.IsPositive() {
+		return fmt.Errorf("pending withdrawals for signer %s do not cover the shortfall of %s", signer, remaining)
+	}
+
+	return nil
+}

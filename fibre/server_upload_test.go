@@ -1,0 +1,391 @@
+package fibre_test
+
+import (
+	"context"
+	"crypto/ed25519"
+	"testing"
+	"time"
+
+	"github.com/celestiaorg/celestia-app/v11/fibre"
+	"github.com/celestiaorg/celestia-app/v11/fibre/state"
+	"github.com/celestiaorg/celestia-app/v11/fibre/validator"
+	"github.com/celestiaorg/celestia-app/v11/pkg/rsema1d"
+	"github.com/celestiaorg/celestia-app/v11/pkg/rsema1d/rlc"
+	"github.com/celestiaorg/celestia-app/v11/x/fibre/types"
+	core "github.com/cometbft/cometbft/types"
+	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
+	txsigning "github.com/cosmos/cosmos-sdk/types/tx/signing"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// TestServerUploadShard unit tests the [Server.UploadShard].
+// It currently covers random cases and should be eventually extended for 100% coverage.
+// The request modifier approach should allow simulating any failure.
+func TestServerUploadShard(t *testing.T) {
+	server, valSet, serverValidator := makeTestServer(t)
+
+	tests := []struct {
+		name            string
+		requestModifier func(*types.UploadShardRequest)
+		check           func(*testing.T, *types.UploadShardResponse, error)
+	}{
+		{
+			name:            "Success",
+			requestModifier: nil,
+			check: func(t *testing.T, resp *types.UploadShardResponse, err error) {
+				require.NoError(t, err)
+				require.NotNil(t, resp)
+				require.NotEmpty(t, resp.ValidatorSignature)
+				require.Len(t, resp.ValidatorSignature, ed25519.SignatureSize)
+			},
+		},
+		{
+			name: "InvalidPaymentPromise",
+			requestModifier: func(req *types.UploadShardRequest) {
+				// invalidate promise by removing signature
+				req.Promise.Signature = nil
+			},
+			check: func(t *testing.T, resp *types.UploadShardResponse, err error) {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "signature must be 64 bytes")
+			},
+		},
+		{
+			name: "WrongChainID",
+			requestModifier: func(req *types.UploadShardRequest) {
+				// set wrong chain ID
+				req.Promise.ChainId = "wrong-chain"
+			},
+			check: func(t *testing.T, resp *types.UploadShardResponse, err error) {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "chain ID mismatch")
+			},
+		},
+		{
+			name: "TimestampTooOld",
+			requestModifier: func(req *types.UploadShardRequest) {
+				// set timestamp 2 hours ago (exceeds default 1 hour PaymentPromiseTimeout)
+				req.Promise.CreationTimestamp = time.Now().Add(-2 * time.Hour)
+			},
+			check: func(t *testing.T, resp *types.UploadShardResponse, err error) {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "payment promise expired")
+			},
+		},
+		{
+			name: "InvalidRowAssignment",
+			requestModifier: func(req *types.UploadShardRequest) {
+				// replace with another validator's rows
+				serverCfg := server.Config
+				blobCfg, _ := fibre.BlobConfigForVersion(uint8(req.Promise.BlobVersion))
+				totalRows := blobCfg.OriginalRows + blobCfg.ParityRows
+				// get commitment from the request (it's already a byte slice)
+				var commitment rsema1d.Commitment
+				copy(commitment[:], req.Promise.Commitment)
+				shardMap := valSet.Assign(commitment, totalRows, blobCfg.OriginalRows, serverCfg.MinRowsPerValidator, serverCfg.LivenessThreshold)
+				for val, indices := range shardMap {
+					if val.Address.String() != serverValidator.Address.String() && len(indices) > 0 {
+						req.Shard.Rows[0].Index = uint32(indices[0])
+						break
+					}
+				}
+			},
+			check: func(t *testing.T, resp *types.UploadShardResponse, err error) {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "shard assignment verification failed")
+			},
+		},
+		{
+			name: "DuplicateRows",
+			requestModifier: func(req *types.UploadShardRequest) {
+				// repeat the first assigned row across every slot: the count and
+				// membership checks pass, but the rows are not unique
+				require.Greater(t, len(req.Shard.Rows), 1, "need >1 assigned row to duplicate")
+				for i := range req.Shard.Rows {
+					req.Shard.Rows[i] = req.Shard.Rows[0]
+				}
+			},
+			check: func(t *testing.T, resp *types.UploadShardResponse, err error) {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "shard assignment verification failed")
+				require.Contains(t, err.Error(), "duplicate row")
+			},
+		},
+		{
+			name: "InvalidRowProof",
+			requestModifier: func(req *types.UploadShardRequest) {
+				// corrupt the proof
+				req.Shard.Rows[0].Proof[0] = []byte("invalid proof")
+			},
+			check: func(t *testing.T, resp *types.UploadShardResponse, err error) {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "verification failed")
+			},
+		},
+		{
+			name: "MissingRows",
+			requestModifier: func(req *types.UploadShardRequest) {
+				// remove all rows
+				req.Shard.Rows = nil
+			},
+			check: func(t *testing.T, resp *types.UploadShardResponse, err error) {
+				require.Error(t, err)
+			},
+		},
+		{
+			name: "NilShard",
+			requestModifier: func(req *types.UploadShardRequest) {
+				// omit the entire Shard message (a peer can send UploadShard
+				// with the Shard field unset). The handler must reject this
+				// gracefully rather than panicking on a nil dereference.
+				req.Shard = nil
+			},
+			check: func(t *testing.T, resp *types.UploadShardResponse, err error) {
+				require.Error(t, err)
+				require.Nil(t, resp)
+			},
+		},
+		{
+			name: "InvalidUploadSize",
+			requestModifier: func(req *types.UploadShardRequest) {
+				// Keep the declared size above the local minimum but inconsistent with rows.
+				req.Promise.BlobSize++
+			},
+			check: func(t *testing.T, resp *types.UploadShardResponse, err error) {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "upload size mismatch")
+			},
+		},
+		{
+			name: "OversizedRow",
+			requestModifier: func(req *types.UploadShardRequest) {
+				// craft rows one chunk larger than the protocol maximum. The
+				// handler must reject these before they are signed/stored, since
+				// the read-side row pool is sized for MaxRowSize.
+				blobCfg, _ := fibre.BlobConfigForVersion(uint8(req.Promise.BlobVersion))
+				oversized := blobCfg.MaxRowSize + 64
+				for i := range req.Shard.Rows {
+					req.Shard.Rows[i].Data = make([]byte, oversized)
+				}
+				req.Promise.BlobSize = uint32(oversized * blobCfg.OriginalRows)
+			},
+			check: func(t *testing.T, resp *types.UploadShardResponse, err error) {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "exceeds maximum")
+				require.Nil(t, resp)
+			},
+		},
+		{
+			name: "OversizedRLCs",
+			requestModifier: func(req *types.UploadShardRequest) {
+				// increase the RLC field to a larger 16-byte-aligned size. The
+				// handler must reject it on length before decoding it into a
+				// vector, since v0 requires exactly one GF128 value per row.
+				req.Shard.Rlcs = make([]byte, len(req.Shard.Rlcs)*2)
+			},
+			check: func(t *testing.T, resp *types.UploadShardResponse, err error) {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "RLC bytes, got")
+				require.Nil(t, resp)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := makeTestRequest(t, valSet, serverValidator, tt.requestModifier)
+			resp, err := server.UploadShard(t.Context(), req)
+			tt.check(t, resp, err)
+		})
+	}
+}
+
+func TestServerUploadShardBudgetExceeded(t *testing.T) {
+	// Full-stake budget = OriginalRows, so the derived per-node budget is
+	// assignedRows bytes — orders of magnitude below one shard, forcing a reject.
+	server, valSet, serverValidator := makeTestServerWithConfig(t, withStateBudget(int64(fibre.DefaultProtocolParams.Rows)))
+
+	req := makeTestRequest(t, valSet, serverValidator, nil)
+	resp, err := server.UploadShard(t.Context(), req)
+
+	require.Nil(t, resp)
+	st, ok := status.FromError(err)
+	require.True(t, ok, "expected a gRPC status error")
+	require.Equal(t, codes.ResourceExhausted, st.Code())
+
+	var retryInfo *errdetails.RetryInfo
+	for _, d := range st.Details() {
+		if ri, ok := d.(*errdetails.RetryInfo); ok {
+			retryInfo = ri
+		}
+	}
+	require.NotNil(t, retryInfo, "rejection must carry a RetryInfo detail")
+	require.Positive(t, retryInfo.GetRetryDelay().AsDuration())
+}
+
+// makeTestRequest creates a valid UploadShardRequest for the given test setup.
+// Optional modifier can be provided to customize the request after construction.
+// The promise is automatically re-signed after modification.
+func makeTestRequest(
+	t *testing.T,
+	valSet validator.Set,
+	serverValidator *core.Validator,
+	requestModifier func(*types.UploadShardRequest),
+) *types.UploadShardRequest {
+	t.Helper()
+
+	blob := makeTestBlobV0(t, 256*1024)
+
+	// create and sign payment promise
+	keyring := makeTestKeyring(t)
+	key, err := keyring.Key(fibre.DefaultKeyName)
+	require.NoError(t, err)
+	pubKey, err := key.GetPubKey()
+	require.NoError(t, err)
+
+	// sign function that can be called to (re)sign the promise
+	signPromise := func(promisePb *types.PaymentPromise) {
+		// load into PaymentPromise to compute sign bytes
+		promise := &fibre.PaymentPromise{}
+		require.NoError(t, promise.FromProto(promisePb))
+
+		signBytes, err := promise.SignBytes()
+		require.NoError(t, err)
+		signature, _, err := keyring.Sign(fibre.DefaultKeyName, signBytes, txsigning.SignMode_SIGN_MODE_DIRECT)
+		require.NoError(t, err)
+
+		// update proto with new signature
+		promisePb.Signature = signature
+	}
+
+	promise := &fibre.PaymentPromise{
+		ChainID:           "celestia",
+		Height:            100,
+		Namespace:         testNamespace,
+		UploadSize:        uint32(blob.UploadSize()),
+		BlobVersion:       uint32(blob.ID().Version()),
+		Commitment:        blob.ID().Commitment(),
+		CreationTimestamp: time.Now(),
+		SignerKey:         pubKey.(*secp256k1.PubKey),
+	}
+
+	promisePb, err := promise.ToProto()
+	require.NoError(t, err)
+	signPromise(promisePb)
+
+	// get row assignment for server validator
+	serverCfg := fibre.DefaultServerConfig()
+	blobCfg := blob.Config()
+	totalRows := blobCfg.OriginalRows + blobCfg.ParityRows
+	shardMap := valSet.Assign(blob.ID().Commitment(), totalRows, blobCfg.OriginalRows, serverCfg.MinRowsPerValidator, serverCfg.LivenessThreshold)
+	rowIndices := shardMap[serverValidator]
+	require.NotEmpty(t, rowIndices, "server validator has no rows assigned")
+
+	// create rows with proofs
+	rows := make([]*types.BlobRow, 0, len(rowIndices))
+	require.NoError(t, blob.RowProofs(rowIndices, func(index int, row []byte, proof [][]byte) {
+		rows = append(rows, &types.BlobRow{
+			Index: uint32(index),
+			Data:  row,
+			Proof: proof,
+		})
+	}))
+
+	req := &types.UploadShardRequest{
+		Promise: promisePb,
+		Shard: &types.BlobShard{
+			Rows: rows,
+			Rlcs: rlc.Marshal(blob.RLC()),
+		},
+	}
+
+	// apply request modifier after construction
+	if requestModifier != nil {
+		requestModifier(req)
+		// automatically re-sign the promise after modification, unless signature was explicitly removed
+		if len(req.Promise.Signature) > 0 {
+			signPromise(req.Promise)
+		}
+	}
+
+	return req
+}
+
+type countingPromiseState struct {
+	state.Client
+	calls int
+}
+
+func (s *countingPromiseState) VerifyPromise(ctx context.Context, p *state.PaymentPromise) (state.VerifiedPromise, error) {
+	s.calls++
+	return s.Client.VerifyPromise(ctx, p)
+}
+
+func TestServerLocalMinUploadSize(t *testing.T) {
+	var stateClient *countingPromiseState
+	server, valSet, serverValidator := makeTestServerWithConfig(t, func(cfg *fibre.ServerConfig) {
+		cfg.MinUploadSize = 32 << 20
+		inner := cfg.StateClientFn
+		cfg.StateClientFn = func() (state.Client, error) {
+			client, err := inner()
+			stateClient = &countingPromiseState{Client: client}
+			return stateClient, err
+		}
+	})
+	req := makeTestRequest(t, valSet, serverValidator, nil)
+	resp, err := server.UploadShard(t.Context(), req)
+	require.Nil(t, resp)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.ErrorContains(t, err, "below local minimum 33554432 bytes")
+	require.Zero(t, stateClient.calls, "rejected uploads must not reserve escrow")
+
+	// Test the inclusive boundary against actual padded bytes, not payload size.
+	server.Config.MinUploadSize = int(req.Promise.BlobSize)
+	resp, err = server.UploadShard(t.Context(), req)
+	require.NoError(t, err)
+	require.NotEmpty(t, resp.ValidatorSignature)
+	require.Equal(t, 1, stateClient.calls)
+
+	// Raising the local admission minimum must not block existing downloads.
+	server.Config.MinUploadSize = 32 << 20
+	id := fibre.NewBlobID(0, rsema1d.Commitment(req.Promise.Commitment))
+	downloaded, err := server.DownloadShard(t.Context(), &types.DownloadShardRequest{BlobId: id})
+	require.NoError(t, err)
+	require.NotNil(t, downloaded)
+}
+
+// TestServerUploadShardCheapChecksFirst checks that structurally malformed
+// shards are rejected before the promise signature is checked or the app node
+// is queried.
+func TestServerUploadShardCheapChecksFirst(t *testing.T) {
+	var stateClient *countingPromiseState
+	server, valSet, serverValidator := makeTestServerWithConfig(t, func(cfg *fibre.ServerConfig) {
+		inner := cfg.StateClientFn
+		cfg.StateClientFn = func() (state.Client, error) {
+			client, err := inner()
+			stateClient = &countingPromiseState{Client: client}
+			return stateClient, err
+		}
+	})
+
+	for name, modify := range map[string]func(*types.UploadShardRequest){
+		"nil shard":     func(req *types.UploadShardRequest) { req.Shard = nil },
+		"no rows":       func(req *types.UploadShardRequest) { req.Shard.Rows = nil },
+		"short rlcs":    func(req *types.UploadShardRequest) { req.Shard.Rlcs = req.Shard.Rlcs[:16] },
+		"proof segment": func(req *types.UploadShardRequest) { req.Shard.Rows[0].Proof[0] = []byte{1} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := makeTestRequest(t, valSet, serverValidator, modify)
+			// Corrupt the signature too: the shard check must fire first.
+			req.Promise.Signature[0] ^= 0xff
+			resp, err := server.UploadShard(t.Context(), req)
+			require.Nil(t, resp)
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+			require.NotContains(t, err.Error(), "signature")
+			require.Zero(t, stateClient.calls, "malformed shards must not reach the app node")
+		})
+	}
+}

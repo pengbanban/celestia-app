@@ -1,0 +1,614 @@
+# Release Notes
+
+This guide provides notes for major version releases. These notes may be helpful for users when upgrading from previous major versions.
+
+## v11.0.0
+
+### State Machine Changes (v11.0.0)
+
+**`x/zkism`**:
+
+- Messages are verified against a proven source chain merkle tree root instead of a proven list of message ids. `SubmitMessages` stores the root and leaf count from fixed 101-byte public values (`version (u8) || state_root || merkle_tree_address || tree_root || count (u32)`), and each message is delivered with merkle proof metadata (`leaf_index (u32, big-endian) || 32 x 32-byte branch`). Proofs produced by the previous membership program are rejected.
+- Existing ISMs keep working only after their owner installs the new program's verifying keys with `UpdateVerifyingKeys`. Until then no message verifies for that ISM.
+- ISM owners can replace the verifying keys (`UpdateVerifyingKeys`), and transfer or renounce ownership (`TransferOwnership`). Anyone relying on an ISM must trust its current owner; a renounced ISM (empty `owner`) is immutable. ISMs created before v11 keep their creator as owner and are mutable from the upgrade until that owner renounces. Rotating the keys discards the merkle tree state proven under the previous keys.
+- `UpdateVerifyingKeys` counts toward the per-block ZK proof message cap and, like the other proof-work messages, is rejected inside governance proposals.
+- At most one state transition proof and one membership proof are accepted per ISM per block; a second one fails with `ErrAlreadyUpdatedInBlock` (code 15). The ISM records `state_height` and the merkle tree state records `height` for this. Gas simulation skips this check.
+- Each ISM stores at most `root_history_size` replaced state roots and at most `root_history_size` replaced merkle tree states at any time (default 64, at most 256). `SubmitMessages` accepts a proof against any kept state root and `Verify` accepts a merkle proof against any kept tree root, so a root update between proving and inclusion no longer invalidates in-flight proofs. The owner sets the size at creation or with `UpdateRootHistorySize`; the `RootHistory` query lists the kept roots.
+- The genesis field `submissions` is deprecated: it is ignored on import and no longer exported. Genesis gains `state_root_history` and `tree_state_history`.
+- The zkism genesis section no longer contains `messages`. A genesis file exported by a v10 binary must have `app_state.zkism.messages` removed before a v11 binary can load it.
+
+See the [x/zkism README](../../x/zkism/README.md) for details.
+
+## v10.0.0
+
+### Node Operators (v10.0.0)
+
+Node operators MUST upgrade their binary to this version prior to the v10 activation height.
+
+#### Update config files
+
+Validators are recommended to run the following command with a v10.3.0 or later binary to add missing fields and their documentation to `config.toml` and Fibre's `server_config.toml` before changing settings:
+
+```sh
+celestia-appd config sync --home ~/.celestia-app --fibre-home ~/.celestia-fibre
+```
+
+Use your node's and Fibre's home directories if they differ. A file is skipped if it does not exist, e.g. `config.toml` on a Fibre-only host. The command preserves existing values and creates a backup before making changes. Add `--dry-run` to preview additions. Synchronization does not run automatically on startup.
+
+#### Fibre
+
+v10 introduces fibre, a data availability protocol served by validator-operated fibre servers. Validators should follow the [fibre server guide](../../fibre/cmd/README.md) — prerequisites, setup, and the on-chain host registration via [`x/valaddr`](../../x/valaddr/README.md) — to start serving fibre traffic once v10 is live.
+
+We recommend running the fibre server on a separate machine with its own public IP address. Fibre's endpoint is advertised on-chain and serves public client traffic. Register the Fibre host's public address in `x/valaddr`; using the validator node's IP exposes it to direct traffic and denial-of-service attacks. A separate Fibre host avoids disclosing the validator's IP through Fibre, but other services, including P2P, can still expose it.
+
+Connect Fibre to the validator's application gRPC and privval signer gRPC endpoints over a trusted private network or encrypted tunnel, and restrict access to the Fibre host. Configure [mutual TLS for the signer connection](../../fibre/cmd/README.md#signing) on both sides. Application gRPC is plaintext, so keep it off the public internet. Only Fibre's client port (default `7980`) needs to be publicly reachable for Fibre clients.
+
+For separate hosts, edit the validator's `config/app.toml`: in the existing `[grpc]` section, set `enable = true` and bind `address` to its restricted private IP, for example `address = "10.0.0.5:9090"`. Restart the validator and set Fibre's `--app-grpc-address 10.0.0.5:9090` to match. Replace the example IP with your validator's private address. The guide's `127.0.0.1:9090` examples apply to same-host deployments; on a separate Fibre host, loopback points to Fibre's own machine.
+
+We recommend storing fibre server data and celestia-app data on separate disks. This prevents unexpected storage growth in either service from consuming the disk space available to the other.
+
+#### Fibre S3-Compatible Object Storage
+
+The v10.4.0 releases include experimental support for storing Fibre blob shards in S3-compatible object storage, such as Amazon S3 or Cloudflare R2. Validators can opt in; local storage remains the default. Fibre's metadata database and the consensus node's data still require persistent local storage.
+
+Run [config sync](#update-config-files), then set `storage_backend = "object"` and configure `[object_storage]` in Fibre's `config/server_config.toml`. For example, with an existing S3 bucket:
+
+```toml
+storage_backend = "object"
+
+[object_storage]
+endpoint = "https://s3.us-east-1.amazonaws.com"
+region = "us-east-1"
+bucket = "my-fibre-shards"
+prefix = "fibre"
+```
+
+Create the bucket in the same region as the Fibre host; a bucket in another region adds latency to every upload and download. Use your bucket's endpoint and region. For Cloudflare R2, use its S3 API endpoint and `region = "auto"`. Credentials are loaded through the AWS SDK credential chain, such as `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in the Fibre service's environment. See [object storage credentials](../../fibre/cmd/README.md#object-storage-credentials) for systemd setup. Grant read, write, and delete access to the configured bucket and prefix, then restart Fibre.
+
+Changing backends affects new shards only; it does not migrate existing shards. Keep the local data directory and access to the original object bucket and prefix for retained shards, including after switching back to local storage. See the [storage backend guide](../../fibre/cmd/README.md#switching-shard-storage-backends) before changing the backend or object namespace.
+
+#### Key Management Systems (KMS)
+
+The horcrux deprecation announced in the v7 release notes is superseded. Any KMS infrastructure may be used, provided it meets both requirements:
+
+- **Arbitrary-byte signing**: the KMS must support the privval `SignRawBytes` message, which is required for fibre payment-promise endorsements and the fibre TLS identity.
+- **Signing latency**: median signing latency must stay at or below 10ms. Nodes using a remote signer expose `cometbft_privval_signing_latency_*` Prometheus metrics and log a warning when the median latency of the last 50 signatures exceeds 10ms. Validators should monitor these metrics and keep their setup (e.g. via colocation) within the threshold.
+
+Horcrux is currently under-maintained. Additionally, a couple of slashing incidents have occurred due to misconfigured horcrux setups. Validators who choose to run horcrux accept these risks.
+
+As a reminder, KMS are third-party software and validators are responsible for ensuring their own KMS setup is correctly configured. An incorrect setup may result in double signing, which can lead to slashing. Validators choosing to run a KMS do so at their own risk.
+
+#### Privval gRPC Endpoint Enabled by Default
+
+Fresh v10 configurations enable a privval gRPC endpoint, which the fibre server uses for payment-promise endorsements and its TLS identity. The default listen address moved from `127.0.0.1:26659` to `127.0.0.1:26669` to avoid a TMKMS port clash. Existing configurations retain their saved address or empty (disabled) value; replacing the binary does not rewrite it. Check the top-level `priv_validator_grpc_laddr` in `config/config.toml` and set Fibre's signer address to match. Nodes that don't serve fibre can disable it by clearing this setting.
+
+Fibre also needs application gRPC enabled in the `[grpc]` section of `config/app.toml` (normally port `9090`). This is separate from `[rpc] grpc_laddr` in `config/config.toml` (normally port `9098`); preserve the latter for existing core RPC clients. See the [connection settings and address formats](../../fibre/cmd/README.md#node-connections).
+
+The default privval address, `127.0.0.1:26669`, allows unencrypted connections from the same host. No TLS certificates or extra flags are needed when Fibre connects to this address.
+
+If Fibre connects from another host or container, configure mutual TLS on both sides. Without it, the node refuses to start with a privval address such as `0.0.0.0:26669`, and Fibre refuses to connect to a remote signer. Follow the [core privval TLS guide](https://github.com/celestiaorg/celestia-core/blob/main/docs/guides/privval-grpc-tls.md) to generate certificates and configure the node and Fibre. The server certificate must match the IP address or DNS name Fibre connects to. Restart both services after configuring or replacing certificates.
+
+Keep the signing port on a private network and restrict access to the Fibre host. For local development only, `--privval-grpc-allow-insecure` on the node and `--signer-grpc-allow-insecure` on Fibre allow remote connections without TLS. Do not use these overrides in production: anyone who can reach the unprotected endpoint can request signatures from the validator key.
+
+#### Heavy RPC Requests Are Limited
+
+celestia-core v0.41.0 gates heavy RPC responses (`block`, `block_results`, `tx_search`, `unconfirmed_txs`, share and data-root proofs, and the gRPC block, validator-set, and proof endpoints) behind a process-wide concurrency limit. It is configurable via `max_concurrent_heavy_requests` in the `[rpc]` section of `config.toml` (default 20) and is shared across HTTP JSON-RPC, URI, WebSocket, and gRPC. Excess requests are rejected with HTTP 503 / gRPC `ResourceExhausted`. Public RPC providers may want to raise this limit.
+
+#### Fibre Connection Lifetimes
+
+Fibre gRPC connections rotate after approximately five minutes, with a two-minute grace period for unfinished RPCs. gRPC adds jitter to the connection age. Custom clients must reconnect and handle requests interrupted when the grace period expires. This bounds stalled streams that previously held connection slots indefinitely; it does not change shard retention or promise expiry.
+
+Fibre now applies the chain's stateless payment-promise checks before storing and signing uploads. Clients submitting invalid promises receive an error instead of an endorsement that cannot be settled. No server configuration change is required.
+
+#### Multiplexer Startup Flags
+
+During genesis sync and pre-v10 operation, the multiplexer forwards only explicitly set start flags supported by the selected embedded binary. Flags specific to the outer v10 node are not passed to older binaries. Supported values are preserved, including values containing spaces, commas, or text that looks like another flag. Mandatory child-process overrides still take precedence.
+
+#### Restart After an Interrupted Commit
+
+The updated SDK store discards an incomplete IAVL version left by an interrupted commit and replays the block on restart. If a node was killed during a commit, try restarting with the updated binary before attempting a manual rollback. This recovery applies to an incomplete commit; it is not a general repair for database corruption.
+
+#### Genesis Exports
+
+Genesis export now includes all message IDs for each zkISM. Older binaries exported at most 100 IDs per ISM without reporting an error. If an ISM has more than 100 IDs, regenerate any export intended for a restart or migration using the updated binary. Updating the binary cannot restore IDs already omitted from an old export.
+
+#### Blockstore Compaction
+
+New `[storage]` options in `config.toml`: `compact` (default `false`) and `compaction_interval` (default `10000`). When enabled, the blockstore is compacted asynchronously over the pruned range, keeping pruned nodes at a bounded disk size. A new `celestia-appd compact-blockstore` command performs a one-off compaction of an existing blockstore.
+
+Automatic compaction covers newly pruned blocks. To reclaim space from an existing pruned backlog, stop the node and run `celestia-appd compact-blockstore --home <node-home>` before enabling it. Compaction does not enable pruning; archival nodes should retain `min-retain-blocks = 0` in `app.toml`.
+
+#### Updating Existing Configuration Files
+
+At startup, missing fields use the binary's defaults without rewriting existing files. The deprecated `celestia-appd update-config` command only supports the v6 migration; use `celestia-appd config sync` to add missing v10 settings and their documentation.
+
+Run [`celestia-appd config sync`](#update-config-files) first, then edit the resulting fields in `config/config.toml`. For example, change `[rpc] max_concurrent_heavy_requests` to adjust the heavy RPC limit, or `[storage] compact` and `compaction_interval` to configure compaction. Existing values, including disabled services and custom ports, are preserved by synchronization; change them explicitly when needed.
+
+The command updates `config.toml` and, if present, Fibre's `server_config.toml`. Back up and edit `config/app.toml` separately. If configuration is managed by deployment tooling, update its source templates too.
+
+Review the diff, restart the node, and verify that it resumes syncing and its configured services are reachable. If a configuration edit causes a problem, restore the backed-up settings and restart. Leaving these new fields absent requires no config rewrite.
+
+#### Metrics Push via OTLP
+
+`celestia-appd start` accepts a new `--otel-endpoint` flag (env `CELESTIA_APP_OTEL_ENDPOINT`) that pushes node metrics (SDK telemetry, CometBFT, Go runtime) to an OpenTelemetry collector over OTLP HTTP.
+
+### State Machine Changes (v10.0.0)
+
+#### New Modules (v10.0.0)
+
+**`x/fibre`**: escrow, payment promises, and settlement for fibre. `MsgPayForFibre` pays for blob dissemination through fibre. See the [x/fibre README](../../x/fibre/README.md).
+
+**`x/valaddr`**: on-chain registration of validator fibre hosts. Stale provider entries are garbage collected in EndBlock. See the [x/valaddr README](../../x/valaddr/README.md).
+
+#### Evidence Window
+
+`MaxAgeNumBlocks` is reduced from 559,940 to 404,400 so the evidence window stays within the unbonding period at block times up to 3s ([#7706](https://github.com/celestiaorg/celestia-app/pull/7706)). Equivocation evidence naming a validator no longer in staking state is ignored instead of erroring out of FinalizeBlock ([#7718](https://github.com/celestiaorg/celestia-app/pull/7718)).
+
+### Library Consumers (v10.0.0)
+
+Custom multiplexer integrations must update calls to `abci.NewMultiplexer` and `cmd.New` for their new arguments. `Version.GetStartArgs` now takes a parsed `*pflag.FlagSet` instead of a raw argument slice. These Go API changes do not require changes to the normal `celestia-appd start` command.
+
+## v9.0.0
+
+### Node Operators (v9.0.0)
+
+#### Supported operating systems
+
+The canonical matrix of supported operating systems lives in the [README](../../README.md#supported-operating-systems). For v9.0.0 specifically:
+
+- **Tested in CI**: Ubuntu 24.04 LTS (Noble Numbat) on x86_64.
+- **Prebuilt binaries provided**: Linux (`amd64`, `arm64`), macOS (`amd64`, `arm64`). arm64 binaries are cross-compiled and are not executed in CI.
+- **Minimum glibc**: 2.38. Ubuntu 22.04 and older are **not supported** for multiplexer builds and will fail to start with a glibc version mismatch error.
+- **Changes since v8.0.0**: none. (v9 is the first release to record the matrix explicitly; the underlying CI and binary-target configuration is unchanged from v8.)
+
+#### `update-config` Command Deprecated
+
+The `celestia-appd update-config` command is deprecated. The config values it used to apply are now enforced by the binary at startup, so running it when initialising a new node is no longer necessary. The command still works for now but prints a deprecation warning and will be removed in a future release.
+
+#### Block Sync: `verify_data` Default Changed to `false`
+
+The default value of `verify_data` in the `[blocksync]` section of `config.toml` is now `false`. Consensus nodes no longer re-run `ProcessProposal` on each block during block sync, which meaningfully speeds up syncing. This is safe because every block received during block sync is already signed by 2/3+ of the voting power; normal validation resumes once the node switches to consensus mode. Set `verify_data = true` in `config.toml` to restore the previous behaviour.
+
+#### Pruning
+
+`min-retain-blocks` is now honoured even when it is lower than the evidence window (`MaxAgeNumBlocks`) ([#6954](https://github.com/celestiaorg/celestia-app/issues/6954)). If you change `min-retain-blocks` from `0` to another value, the node will start pruning the backlog on startup; if it has been running for a long time this can take a while, so either leave it running until it catches up or re-sync a fresh node (e.g. via state sync) if history is not important to you. Archival nodes must keep `min-retain-blocks = 0` (the default): any non-zero value enables pruning and the node will no longer be a full archival node.
+
+## v8.0.0
+
+### Node Operators (v8.0.0)
+
+Node operators MUST upgrade their binary to this version prior to the v8 activation height.
+
+#### Prerequisites
+
+##### Minimum OS Version
+
+The v8 multiplexer embeds a v7 binary that was compiled against glibc >= 2.38, which means **Ubuntu 24.04 or later** (or an equivalent distribution) is required. Nodes running older OS versions (e.g., Ubuntu 22.04) will fail to start with a glibc version mismatch error. If you encounter this, upgrade your host OS before proceeding with the v8 upgrade.
+
+#### Upgrade Handler
+
+The upgrade handler re-applies the commission rate migrations from v7 (min 20%, max 60%) to ensure validators that upgraded directly from v6 are compliant. These migrations are idempotent — validators already compliant from v7 are unaffected.
+
+#### Node Shutdown on Consensus Panic
+
+v8 changes the behavior when a consensus panic occurs. Previously, a consensus panic only stopped the consensus reactor while the rest of the node (RPC, mempool, p2p) continued running. This gave node operators the false impression that their node was still functional. Starting in v8, a consensus panic triggers a **full node shutdown** ([celestia-core#2222](https://github.com/celestiaorg/celestia-core/issues/2222)). Node operators using process managers (e.g., systemd) should ensure their restart policies account for this change.
+
+### State Machine Changes (v8.0.0)
+
+#### Forwarding Address Derivation (Breaking)
+
+v8 binds the token identity to forwarding address derivation in `x/forwarding` ([#6906](https://github.com/celestiaorg/celestia-app/pull/6906)). Frontends and relayers select the token route off-chain and the module verifies it matches the derived address. Each unique `(destDomain, destRecipient, tokenId)` tuple now derives its own forwarding address. Any assets sent to a forwarding address with a mismatched denomination are irrecoverable by design. Existing forwarding addresses derived without the token identifier will no longer be valid.
+
+## v7.0.0
+
+### Node Operators (v7.0.0)
+
+Node operators MUST upgrade their binary to this version prior to the v7 activation height.
+
+#### Prerequisites
+
+##### Minimum OS Version
+
+> [!CAUTION]
+> The multiplexer embeds binaries that were compiled against glibc >= 2.38, which means **Ubuntu 24.04 or later** (or an equivalent distribution) is required. Nodes running older OS versions (e.g., Ubuntu 22.04) will fail to start with a glibc version mismatch error. If you encounter this, upgrade your host OS before proceeding with the upgrade.
+
+#### Validator Commission Rate Changes
+
+v7 enforces new commission rate bounds:
+
+- **Minimum commission rate**: 20% (previously variable)
+- **Maximum commission rate**: 60%
+
+Non-compliant validators will have their rates **automatically adjusted** at the upgrade height:
+
+- Validators with a commission rate below 20% will be set to 20%
+- Validators with a max commission rate below 60% will be set to 60%
+
+No manual action is required, but validators should be aware of this change.
+
+#### Horcrux Deprecation
+
+Horcrux is deprecated starting in v7. Future upgrades will require validator keys for fibre, which demands very low signing latency. Horcrux adds signing latency due to threshold signing and network round trips between cosigner nodes, which may be incompatible with upcoming latency requirements. Validators using horcrux should plan to migrate to a local signing setup.
+
+#### Config Changes
+
+##### `min-retain-blocks`
+
+v7 enforces a minimum `min-retain-blocks` value of 3000. This ensures nodes retain enough blocks for other nodes to sync from state sync snapshots. If `min-retain-blocks` in `app.toml` is set to a value between 1 and 2999, the node will log a warning and automatically override the value to 3000 on startup. Valid values:
+
+- `0` (default): retain all blocks (no pruning)
+- `1-2999`: automatically overridden to 3000 with a log warning
+- `>= 3000`: retain at least that many blocks
+
+##### Mempool Type
+
+The mempool `type` field has been removed from new `config.toml` files because celestia-app only supports the CAT mempool. If your existing `config.toml` still contains a mempool `type`, it will be ignored and overridden to `cat` at startup with a warning. You can safely remove the `type` line from the `[mempool]` section of your `config.toml`.
+
+Notably, the `nop` mempool is no longer supported. If you were using the nop mempool for a specialized setup, please [open an issue](https://github.com/celestiaorg/celestia-app/issues) so we can accommodate your use case.
+
+### State Machine Changes (v7.0.0)
+
+#### Blocked Module Account Addresses
+
+v7 prevents direct fund transfers to module accounts via `MsgSend` or `bank send`. Module accounts can still receive funds through protocol mechanisms (e.g., escrow). The governance module account is exempt from this restriction.
+
+#### New Modules
+
+**`x/forwarding`** (CIP-45):
+
+Single-signature cross-chain transfers through Celestia via Hyperlane warp routes. Users send tokens to a deterministically derived forwarding address, and anyone can permissionlessly trigger forwarding to the committed destination.
+
+- `MsgForward` - Forwards tokens from a forwarding address to a committed destination via Hyperlane
+
+See the [x/forwarding README](../../x/forwarding/README.md) for details.
+
+**`x/zkism`**:
+
+Hyperlane Interchain Security Module (ISM) that authorizes Hyperlane message processing verified by SP1 Groth16 zero-knowledge proofs.
+
+- `CreateInterchainSecurityModule` - Create an ISM with initial state and verifier configuration
+- `UpdateInterchainSecurityModule` - Verify a state transition proof and update ISM state
+- `SubmitMessages` - Verify a membership proof and authorize Hyperlane message IDs
+
+See the [x/zkism README](../../x/zkism/README.md) for details.
+
+#### Store Migrations
+
+v7 adds a new store key for the `zkism` module. This migration is handled automatically by the upgrade handler.
+
+## v6 - 128mb/6s
+
+This section is specific to bumping from 32mb/6s in the v6 release to 128mb/6s. If you're upgrading from v5, please check the [v6.0.0](#v600) first. And only then check this one.
+
+### Hardware requirements
+
+After upgrading to 128mb/6s, specific validator hardware specifications are required to participate in consensus and propose blocks. Based on our validator survey, the following lists the CPUs that passed the benchmark and those that did not. If your CPU is not listed, please run the benchmark available [`tools/cpu_requirements`](../../tools/cpu_requirements/README.md).
+
+<details>
+  <summary>Supported CPUs:</summary>
+- AMD Ryzen 9 7950X
+- AMD Ryzen 9 7950X3D
+- AMD Ryzen 9 9900X
+- AMD Ryzen 7 PRO 8700GE
+- AMD Ryzen 7 3700X
+- AMD Ryzen 3900X
+- AMD 7600
+- AMD 7700X
+- AMD 7900X
+- AMD Ryzen 7900
+- AMD EPYC 4344P
+- AMD EPYC 4464P
+- AMD EPYC 4545P
+- AMD EPYC 4584PX
+- AMD EPYC 7313P
+- AMD EPYC 7452
+- AMD EPYC 7543P 32C/64T
+- AMD EPYC 9124
+- AMD EPYC 9454P
+- AMD EPYC 9555P
+- 13th Gen Intel Core i5-13500
+- Core i7-1270P
+- Intel Xeon-E 2386G
+
+</details>
+
+<details>
+  <summary>NOT supported CPUs:</summary>
+  - AMD Ryzen 9 5950X
+  - AMD EPYC 7443P 24-Core
+  - Intel Xeon Platinum 8474C
+  - Intel Xeon Gold 6254
+  - Intel(R) Xeon(R) Silver 4210
+  - Intel Xeon E5-1620
+  - Intel Dual Xeon Silver 4116
+</details>
+
+### Config Changes
+
+#### `verify_data`
+
+A new `verify_data` option was added to the `[blocksync]` section of `config.toml`. This option controls whether the node calls `ProcessProposal` to validate application data in each block during block sync. It defaults to `true`.
+
+```toml
+[blocksync]
+
+# If true, the node will verify the application data in the block via ProcessProposal
+# during block sync. If false, this verification is skipped.
+# Default: true
+verify_data = true
+```
+
+## v6.0.0
+
+This release contains all the changes from [CIP-042](https://github.com/celestiaorg/CIPs/blob/main/cips/cip-042.md). Notably:
+
+- Lowers the unbonding period to ~14 days
+- Increases maximum block, square, and transaction size
+- Removes the token filter for Hyperlane and IBC
+- Privval Interface Extension for Arbitrary Message Signing
+- Reduce issuance to 2.5% and increase minimum commission to 10%
+
+### Hardware Requirements
+
+v6 changes the [hardware requirements](https://docs.celestia.org/how-to-guides/nodes-overview#consensus-nodes) for consensus nodes. Please ensure your consensus node meets these requirements.
+
+### Binary Building
+
+Validators should build binaries in freshly created environments or download pre-built binaries from official releases. Many validators have experienced issues due to building binaries in environments with outdated dependencies, conflicting libraries, or stale build artifacts.
+
+### Key Management Service (KMS) changes
+
+This release introduces a new message type that needs to be signed by KMS. **If you use Horcrux or TmKMS, you must use these versions to participate in consensus. If you use an alternative KMS, please reach out.**
+
+**Disclaimer:** (KMS) are third-party software. Validators are responsible for ensuring their own KMS setup is correctly configured.
+An incorrect setup may result in double signing, which can lead to slashing. So, any error log should be thoroughly investigated, even if the KMS appears to be signing normally.
+
+Validators must also ensure they maintain a fast and reliable setup. Future network upgrades will require low signing latency, so server colocation can be explored to achieve faster signatures.
+
+**Validators choosing to run KMS do so at their own risk.**
+
+#### Horcrux
+
+For horcrux, use [v3.3.3-celestia](https://github.com/celestiaorg/horcrux/releases/tag/v3.3.3-celestia). All the setups and configs remain the same.
+
+#### TmKMS
+
+For TmKMS, use [v0.15.0](https://github.com/iqlusioninc/tmkms/releases/tag/v0.15.0). All the setups and configs remain the same. Using a prior version will not allow you to propose blocks.
+
+### Config changes
+
+This release introduces a new block propagation reactor and configuration changes to accommodate the increased throughput. The relevant v6 configuration changes can be applied to existing config using the `celestia-appd update-config` command or by manually updating the config.toml and app.toml.
+
+To modify your existing configs, the `celestia-appd update-configs` command can be used.
+
+```shell
+celestia-appd update-config
+```
+
+this uses version 6 and the default home (.celestia-app). Those can be changed or specified with flags as well.
+
+```shell
+celestia-appd update-config --app-version 6 --home ~/.celestia-app
+```
+
+To manually modify the configs, change the following values.
+
+```toml
+[rpc]
+max_body_bytes = 436207616
+
+[p2p]
+send_rate = 25165824
+recv_rate = 25165824
+
+[mempool]
+type = "cat"
+max_tx_bytes = 8388608
+ttl-duration = "0s"
+ttl-num-blocks = 12
+max-gossip-delay = "1m0s"
+
+[consensus]
+enable_legacy_block_prop = false
+```
+
+## v5.0.0
+
+This major upgrade is an expedited patch release, fixing the problem with failed IBC transfers caused by the incorrectly configured capability module. There should be no additional API breaking changes.
+This expedited release will have no upgrade delay. The moment 5/6ths signal and the `MsgTryUpgrade` is successful, the network will upgrade to v5.
+
+## v4.0.0
+
+### Node Operators (v4.0.0)
+
+Node operators MUST upgrade their binary to this version prior to the v4 activation height. Node operators SHOULD NOT use cosmovisor to upgrade their binary.
+
+#### Multiplexer
+
+Celestia-app v4.0.0 introduces support for a [multiplexer](https://github.com/celestiaorg/celestia-app/tree/e5d5ac6732c55150ea3573e17bec162fe836e0c6/multiplexer) that makes it easier for node operators to run a consensus node that can sync from genesis. The multiplexer contains an embedded celestia-app v3.x.x binary that will be used to sync the node from genesis. After the chain advances to app version v4, the multiplexer will stop routing requests to the embedded celestia-app v3.x.x binary and will instead route requests to the v4.x.x state machine. Binaries that are installed from source (via `make install`) will include support for the multiplexer. To install Celestia without the multiplexer, you can use the `make install-standalone` target. Note that the standalone binary will only be able to run on networks that have already upgraded to app version v4.
+
+#### `proxy_app` and `address`
+
+- The default ABCI client address is now `tcp://127.0.0.1:36658` (configured via `--proxy_app` flag or `proxy_app` in config.toml).
+- The default ABCI server address is now `tcp://127.0.0.1:36658` (configured via `--address` flag).
+
+These two configs must match in order for the multiplexer to work correctly. Please update your config.toml to account for the new default
+
+```diff
+-proxy_app = "tcp://127.0.0.1:26658"
++proxy_app = "tcp://127.0.0.1:36658"
+```
+
+#### `rpc.grpc_laddr`
+
+The `rpc.grpc_laddr` config option is now required when running the celestia-app binary with the multiplexer. This option can be set via CLI flag `--rpc.grpc_laddr tcp://127.0.0.1:9098` or in the `config.toml`:
+
+```toml
+[rpc]
+
+# TCP or UNIX socket address for the gRPC server to listen on
+# NOTE: This server only supports /broadcast_tx_commit
+grpc_laddr = "tcp://127.0.0.1:9098"
+```
+
+#### IAVL v1 Migration
+
+Celestia-app v4 uses IAVL v1 for better performance. When upgrading to v4, the migration happens lazily over time. If you'd like to avoid the lazy migration, you can perform a fresh state sync so that your node uses IAVL v1 exclusively.
+
+#### Cosmos SDK default addresses
+
+The default addresses for the Cosmos SDK API server, GRPC server, and GRPC web server have changed from `0.0.0.0` to `localhost`. See [cosmos-sdk#13778](https://github.com/cosmos/cosmos-sdk/pull/13778).
+
+### State Machine Changes (v4.0.0)
+
+Celestia-app v4.0.0 includes significant state machine changes due to major dependency upgrades:
+
+- Cosmos SDK v0.46.16 to v0.50.12
+  - [API breaking changes](https://github.com/cosmos/cosmos-sdk/blob/release/v0.50.x/CHANGELOG.md#api-breaking-changes)
+  - [Client breaking changes](https://github.com/cosmos/cosmos-sdk/blob/release/v0.50.x/CHANGELOG.md#client-breaking-changes)
+  - [CLI breaking changes](https://github.com/cosmos/cosmos-sdk/blob/release/v0.50.x/CHANGELOG.md#cli-breaking-changes)
+- IBC v6.2.2 to v8.7.0
+  - [IBC v8.7.0 release notes](https://github.com/cosmos/ibc-go/releases/tag/v8.7.0)
+- CometBFT v0.34.35 to v0.38.17
+  - [CometBFT v0.38.17 release notes](https://github.com/cometbft/cometbft/releases/tag/v0.38.17)
+
+#### New Messages (Added Modules)
+
+**`x/circuit` Circuit Breaker Module** ([cosmos-sdk docs](https://docs.cosmos.network/sdk/v0.50/build/modules/circuit/README)):
+
+- `MsgAuthorizeCircuitBreaker` - Grant circuit breaker permissions
+- `MsgTripCircuitBreaker` - Disable message execution
+- `MsgResetCircuitBreaker` - Re-enable message execution
+
+**`x/consensus` Consensus Parameters Module** ([cosmos-sdk docs](https://docs.cosmos.network/sdk/v0.50/build/modules/consensus/README)):
+
+- `MsgUpdateParams` - Update consensus parameters via governance (replaces CometBFT consensus param updates)
+
+**Hyperlane**:
+
+- `hyperlane/core` - Cross-chain messaging infrastructure
+- `hyperlane/warp` - Token bridging and routing
+
+#### Removed Messages (Deprecated Modules)
+
+**`x/crisis` Module** - Removed in Cosmos SDK v0.50.x
+
+**`x/capability` Module** - Removed in Cosmos SDK v0.50.x:
+
+- IBC capability management integrated directly into IBC v8 modules
+
+**`x/paramfilter` Module** - Celestia-specific module removed:
+
+- Parameter filtering functionality replaced by circuit breaker
+
+#### Changed Messages and Logic
+
+**Parameter Management Migration**:
+
+- **Generic parameter proposals** deprecated in favor of module-specific `MsgUpdateParams` messages
+- **Consensus parameters** moved from CometBFT to dedicated `x/consensus` module
+- **All modules** now use module-specific parameter update messages instead of legacy `x/params` proposals
+
+**IBC v6 to v8 Protocol Changes** ([v6 to v7](https://ibc.cosmos.network/v8/migrations/v6-to-v7/), [v7 to v8](https://ibc.cosmos.network/v8/migrations/v7-to-v8))
+
+### Library Consumers (v4.0.0)
+
+**Import Changes**:
+
+- Add: `cosmossdk.io/x/circuit`, `cosmossdk.io/x/consensus`
+- Remove: `x/capability`, `x/crisis`, `x/paramfilter`
+- Update: `github.com/cosmos/ibc-go/v8` (from v6)
+
+**API Breaking Changes** ([cosmos-sdk migration guide](https://cosmos-docs.mintlify.app/sdk/v0.50/build/migrations/upgrade-reference)):
+
+- Module keepers now accept `context.Context` instead of `sdk.Context`
+- `BeginBlock`/`EndBlock` signatures changed
+- Parameter updates require module-specific `MsgUpdateParams` messages
+
+## v3.0.0
+
+### Node Operators (v3.0.0)
+
+Node operators MUST upgrade their binary to this version prior to the v3 activation height. Node operators SHOULD NOT use cosmovisor to upgrade their binary.
+
+#### Enabling BBR and MCTCP
+
+Consensus node operators must enable the BBR (Bottleneck Bandwidth and Round-trip propagation time) congestion control algorithm. See [#3774](https://github.com/celestiaorg/celestia-app/pull/3774).
+If using Linux in Docker, Kubernetes, a VM or bare-metal, this can be done by calling
+
+```sh
+make enable-bbr
+```
+
+command on the host machine.
+
+#### Configure Node for V3
+
+Consensus node operators should update several configurations for v3. This can be done by calling:
+
+```sh
+make configure-v3
+```
+
+If the config file is not in the default spot, it can be provided using:
+
+```sh
+make configure-v3 CONFIG_FILE=path/to/other/config.toml
+```
+
+**Alternatively**, the configurations can be changed manually. This involves updating the mempool TTLs and the send and receive rates.
+
+- Configuring Bandwidth Settings
+  - Update `recv_rate` and `send_rate` in your TOML config file to 10MiB (10485760)
+- Extend TTLs
+  - Update `ttl-num-blocks` in your TOML config file to 12
+
+#### Signaling Upgrades
+
+- Upgrades now use the `x/signal` module to coordinate the network to an upgrade height.
+
+The following command can be used, if you are a validator in the active set, to signal to upgrade to v3:
+
+```bash
+celestia-appd tx signal signal 3 <plus transaction flags>
+```
+
+You can track the tally of signalling by validators using the following query
+
+```bash
+celestia-appd query signal tally 3
+```
+
+Once 5/6+ of the voting power have signalled, the upgrade will be ready. There is a hard coded delay between confirmation of the upgrade and execution to the new state machine.
+
+To view the upcoming upgrade height use the following query:
+
+```bash
+celestia-appd query signal upgrade
+> An upgrade is pending to app version 3 at height 2348907.
+```
+
+For more information refer to the module [docs](../../x/signal/README.md)
+
+### Library Consumers (v3.0.0)
+
+- Namespace and share constants in the `appconsts` package were moved to [celestiaorg/go-square](https://github.com/celestiaorg/go-square). See [#3765](https://github.com/celestiaorg/celestia-app/pull/3765).
+
+## [v2.0.0](https://github.com/celestiaorg/celestia-app/releases/tag/v2.0.0)
+
+### Node Operators (v2.0.0)
+
+If you are a consensus node operator, please follow the communication channels listed under [network upgrades](https://docs.celestia.org/operate/maintenance/network-upgrades/#announcement-channels) to learn when this release is recommended for each network (e.g. Mocha, Mainnet Beta).
+
+Consensus node operators are expected to upgrade to this release _prior_ to the Lemongrass hardfork if they intend to continue participating in the network. The command used to start the [consensus node](https://docs.celestia.org/operate/consensus-validators/consensus-node/) or [validator node](https://docs.celestia.org/operate/consensus-validators/validator-node/) will accept an additional `--v2-upgrade-height` flag. See [this table](https://docs.celestia.org/operate/maintenance/network-upgrades/#lemongrass-network-upgrade) for upgrade heights for each network. Node operators SHOULD NOT use cosmovisor to upgrade their binary.
+
+Consensus node operators should enable the BBR (Bottleneck Bandwidth and Round-trip propagation time) congestion control algorithm. See [#3812](https://github.com/celestiaorg/celestia-app/pull/3812).
+
+### Library Consumers (v2.0.0)
+
+If you are a library consumer, a number of the Go APIs have changed since celestia-app v1.x.x. Some of the notable changes are:
+
+- Code pertaining to the original data square was extracted to [celestiaorg/go-square](https://github.com/celestiaorg/go-square).
+  - celestia-app v1.x had a shares package. celestia-app v2.x uses [go-square/shares](https://github.com/celestiaorg/go-square/tree/c8242f96a844956f8d1c60e5511104deed8bc361/shares)
+  - celestia-app v1.x had a blob.types package with `CreateCommitment` function. celestia-app v2.x uses `CreateCommitment` function from the [go-square/inclusion](https://github.com/celestiaorg/go-square/tree/c8242f96a844956f8d1c60e5511104deed8bc361/inclusion).
+- celestia-app v1.x had a lot of functionality included in the signer. celestia-app v2.x splits a txClient from the signer. See [#3433](https://github.com/celestiaorg/celestia-app/pull/3433).

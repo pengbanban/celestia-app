@@ -1,0 +1,92 @@
+name: github-pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - specs/**
+      - proto/**
+      - docs/swagger/index.html
+  pull_request:
+    paths:
+      - specs/**
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+
+      # --- Build mdBook specs ---
+      - name: Setup mdBook
+        env:
+          MDBOOK_VERSION: "0.4.21"
+          MDBOOK_SHA256: ec3c978a255b444987fd6e0805147f4ea75d221f68c6e27dbf3e8a28aba166b7
+        run: |
+          archive="$RUNNER_TEMP/mdbook.tar.gz"
+          curl --fail --location --retry 3 \
+            "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            --output "$archive"
+          echo "$MDBOOK_SHA256  $archive" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/mdbook-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/mdbook-bin" mdbook
+          echo "$RUNNER_TEMP/mdbook-bin" >> "$GITHUB_PATH"
+
+      - name: Build book
+        run: mdbook build specs
+
+      # --- Build Swagger docs ---
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e #v7.0.0
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        with:
+          go-version-file: go.mod
+
+      - name: Setup buf
+        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 #v1.50.0
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install protoc-gen-openapiv2
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: make proto-deps
+
+      - name: Generate Swagger spec
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: make proto-swagger-gen
+
+      # --- Combine into single publish directory ---
+      - name: Prepare publish directory
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          mkdir -p _site/swagger
+          # Copy mdBook output to site root
+          cp -r specs/book/* _site/
+          # Copy Swagger UI and generated spec to site/swagger/
+          cp docs/swagger/index.html _site/swagger/
+          cp docs/swagger/swagger.json _site/swagger/
+
+      # --- Deploy ---
+      - name: Deploy main
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 #v4.1.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./_site
+          # keep_files preserves PR preview directories on gh-pages
+          keep_files: ${{ github.event_name != 'workflow_dispatch' }}
+
+      - name: Deploy PR preview
+        # Only run this job if the PR was created from a branch on celestiaorg/celestia-app
+        # because this job will fail for branches from forks.
+        # https://github.com/celestiaorg/celestia-app/issues/1506
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: rossjrw/pr-preview-action@ffa7509e91a3ec8dfc2e5536c4d5c1acdf7a6de9 #v1.8.1
+        with:
+          source-dir: ./specs/book

@@ -1,0 +1,231 @@
+package app
+
+import (
+	"fmt"
+
+	"cosmossdk.io/errors"
+	apperr "github.com/celestiaorg/celestia-app/v11/app/errors"
+	"github.com/celestiaorg/celestia-app/v11/pkg/appconsts"
+	blobtypes "github.com/celestiaorg/celestia-app/v11/x/blob/types"
+	fibretypes "github.com/celestiaorg/celestia-app/v11/x/fibre/types"
+	blobtx "github.com/celestiaorg/go-square/v4/tx"
+	abci "github.com/cometbft/cometbft/abci/types"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	authsigning "github.com/cosmos/cosmos-sdk/x/auth/signing"
+)
+
+// CheckTx implements the ABCI interface and executes a tx in CheckTx mode. This
+// method wraps the default Baseapp's method so that it can parse and check
+// transactions that contain blobs.
+func (app *App) CheckTx(req *abci.RequestCheckTx) (*abci.ResponseCheckTx, error) {
+	app.checkStateMu.Lock()
+	defer app.checkStateMu.Unlock()
+
+	tx := req.Tx
+
+	// all txs must be less than or equal to the max tx size limit
+	maxTxSize := appconsts.MaxTxSize
+	if len(tx) > maxTxSize {
+		return responseCheckTxWithEvents(errors.Wrapf(apperr.ErrTxExceedsMaxSize, "tx size %d bytes is larger than the application's configured MaxTxSize of %d bytes for version %d", len(tx), maxTxSize, appconsts.Version), 0, 0, []abci.Event{}, false), nil
+	}
+
+	// A PayForFibre recheck skips this wrapper: its checks only depend on bytes
+	// CheckTx already admitted, and the mempool ignores signer/sequence on recheck.
+	if req.Type == abci.CheckTxType_Recheck && pffDecodeCandidate(tx) {
+		return app.BaseApp.CheckTx(req)
+	}
+
+	btx, isBlob, err := blobtx.UnmarshalBlobTxNoCopy(tx)
+	if isBlob && err != nil {
+		if errors.IsOf(err, blobtx.ErrNonCanonicalBlobTx, blobtx.ErrNestedBlobTx) {
+			return responseCheckTxWithEvents(apperr.ErrNonCanonicalBlobTx, 0, 0, []abci.Event{}, false), nil
+		}
+		return responseCheckTxWithEvents(err, 0, 0, []abci.Event{}, false), err
+	}
+
+	if isBlob {
+		return app.handleBlobCheckTx(req, btx)
+	}
+
+	sdkTx, err := app.encodingConfig.TxConfig.TxDecoder()(tx)
+	if err != nil {
+		return responseCheckTxWithEvents(err, 0, 0, []abci.Event{}, false), err
+	}
+
+	for _, msg := range sdkTx.GetMsgs() {
+		if _, ok := msg.(*blobtypes.MsgPayForBlobs); ok {
+			return responseCheckTxWithEvents(blobtypes.ErrNoBlobs, 0, 0, []abci.Event{}, false), nil
+		}
+	}
+
+	checkTxCtx, ok := app.CheckState()
+	if !ok {
+		err := fmt.Errorf("checkState not set")
+		return responseCheckTxWithEvents(err, 0, 0, []abci.Event{}, false), err
+	}
+	if msgCount := countExecutableMsgs(checkTxCtx, app.IBCKeeper.ChannelKeeper, sdkTx.GetMsgs()); msgCount > appconsts.MaxSDKMessages {
+		err := errors.Wrapf(apperr.ErrTxExceedsMaxSDKMessages, "tx contains %d messages, limit is %d", msgCount, appconsts.MaxSDKMessages)
+		return responseCheckTxWithEvents(err, 0, 0, []abci.Event{}, false), nil
+	}
+	if proofCount := countZKProofMsgs(checkTxCtx, app.IBCKeeper.ChannelKeeper, sdkTx.GetMsgs()); proofCount > appconsts.MaxZKProofMessages {
+		err := errors.Wrapf(apperr.ErrTxExceedsMaxZKProofMessages, "tx contains %d proof-work messages, limit is %d", proofCount, appconsts.MaxZKProofMessages)
+		return responseCheckTxWithEvents(err, 0, 0, []abci.Event{}, false), nil
+	}
+	if sigCount := countISMSignatures(checkTxCtx, app.IBCKeeper.ChannelKeeper, sdkTx.GetMsgs()); sigCount > appconsts.MaxISMSignatures {
+		err := errors.Wrapf(apperr.ErrTxExceedsMaxISMSignatures, "tx carries %d ISM signatures, limit is %d", sigCount, appconsts.MaxISMSignatures)
+		return responseCheckTxWithEvents(err, 0, 0, []abci.Event{}, false), nil
+	}
+
+	// MsgPayForFibre must be the only message in its tx.
+	if err := validatePayForFibreTxShape(sdkTx); err != nil {
+		return responseCheckTxWithEvents(err, 0, 0, []abci.Event{}, false), nil
+	}
+	// A tx whose gas limit alone exceeds the block's SDK gas budget can never be
+	// included. PayForFibre txs are bounded by their own per-block count instead.
+	if fibretypes.PayForFibreMsg(sdkTx) == nil {
+		if gas := txGasLimit(sdkTx); !fitsSDKGas(0, gas) {
+			err := errors.Wrapf(apperr.ErrTxExceedsMaxSDKGas, "tx gas limit is %d, limit is %d", gas, appconsts.MaxSDKGas)
+			return responseCheckTxWithEvents(err, 0, 0, []abci.Event{}, false), nil
+		}
+	}
+
+	return app.forwardCheckTx(req, sdkTx)
+}
+
+func (app *App) handleBlobCheckTx(req *abci.RequestCheckTx, btx *blobtx.BlobTx) (*abci.ResponseCheckTx, error) {
+	baseReq := &abci.RequestCheckTx{Tx: btx.Tx, Type: req.GetType()}
+
+	switch req.Type {
+	case abci.CheckTxType_New:
+		if err := blobtypes.ValidateBlobTx(app.encodingConfig.TxConfig, btx, appconsts.SubtreeRootThreshold, appconsts.Version); err != nil {
+			return responseCheckTxWithEvents(err, 0, 0, []abci.Event{}, false), err
+		}
+	case abci.CheckTxType_Recheck:
+		// no need to re-validate a blob
+	default:
+		err := fmt.Errorf("unknown RequestCheckTx type: %s", req.Type)
+		return responseCheckTxWithEvents(err, 0, 0, []abci.Event{}, false), err
+	}
+
+	sdkTx, err := app.encodingConfig.TxConfig.TxDecoder()(baseReq.Tx)
+	if err != nil {
+		return responseCheckTxWithEvents(err, 0, 0, []abci.Event{}, false), err
+	}
+
+	res, err := app.forwardCheckTx(baseReq, sdkTx)
+	if err != nil || res.Code != abci.CodeTypeOK {
+		return res, err
+	}
+
+	// Cache only txs that passed full CheckTx, so ProcessProposal skips
+	// re-validation and invalid spam cannot evict legitimate entries.
+	if req.Type == abci.CheckTxType_New {
+		app.txCache.Set(btx.Tx, btx.Blobs)
+	}
+
+	return res, nil
+}
+
+func (app *App) forwardCheckTx(req *abci.RequestCheckTx, sdkTx sdk.Tx) (*abci.ResponseCheckTx, error) {
+	res, err := app.BaseApp.CheckTx(req)
+	if err != nil {
+		return res, err
+	}
+
+	// BaseApp.CheckTx reports a failed tx via the response code with a nil
+	// error. A failed tx may be malformed in ways that make signerDataFromTx
+	// panic (e.g. a SignerInfo with an unset ModeInfo oneof), so skip it and
+	// return the failure as-is.
+	if res.Code != abci.CodeTypeOK {
+		return res, nil
+	}
+
+	signerAddr, signerSeq, err := signerDataFromTx(sdkTx)
+	if err != nil {
+		return responseCheckTxWithEvents(err, 0, 0, []abci.Event{}, false), err
+	}
+
+	res.Address = signerAddr
+	res.Sequence = signerSeq
+	return res, nil
+}
+
+func responseCheckTxWithEvents(err error, gw, gu uint64, events []abci.Event, debug bool) *abci.ResponseCheckTx {
+	space, code, log := errors.ABCIInfo(err, debug)
+	return &abci.ResponseCheckTx{
+		Codespace: space,
+		Code:      code,
+		Log:       log,
+		GasWanted: int64(gw),
+		GasUsed:   int64(gu),
+		Events:    events,
+	}
+}
+
+func signerDataFromTx(tx sdk.Tx) (addr []byte, seq uint64, err error) {
+	sigTx, ok := tx.(authsigning.SigVerifiableTx)
+	if !ok {
+		return nil, 0, fmt.Errorf("tx of type %T does not implement SigVerifiableTx", tx)
+	}
+
+	// GetSignaturesV2 panics on a malformed SignerInfo (e.g. an unset ModeInfo
+	// oneof). Recover so a bad tx returns an error rather than crashing the
+	// process, which is not always running under a recover (e.g. the mempool).
+	defer func() {
+		if r := recover(); r != nil {
+			addr, seq, err = nil, 0, fmt.Errorf("failed to get signer data: %v", r)
+		}
+	}()
+
+	sigs, err := sigTx.GetSignaturesV2()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if len(sigs) == 0 {
+		return nil, 0, fmt.Errorf("tx of type %T contains no signatures", tx)
+	}
+
+	if sigs[0].PubKey == nil {
+		return nil, 0, fmt.Errorf("tx signer %d has no associated pubkey", 0)
+	}
+
+	return sigs[0].PubKey.Address().Bytes(), sigs[0].Sequence, nil
+}
+
+// validatePayForFibreTxShape rejects txs that mix MsgPayForFibre with other
+// messages, and txs whose payment promise fails stateless validation. Both
+// CheckTx and ProcessProposal call this, so a promise that would fail
+// ValidateBasic in FinalizeBlock never reaches the square.
+func validatePayForFibreTxShape(tx sdk.Tx) error {
+	msgs := tx.GetMsgs()
+	for _, msg := range msgs {
+		pff, isPFF := msg.(*fibretypes.MsgPayForFibre)
+		if !isPFF {
+			continue
+		}
+		if len(msgs) > 1 {
+			return errors.Wrapf(apperr.ErrInvalidPayForFibreTx, "tx contains a MsgPayForFibre and %d total messages", len(msgs))
+		}
+		if err := pff.PaymentPromise.ValidateBasic(); err != nil {
+			return errors.Wrapf(apperr.ErrInvalidPayForFibreTx, "invalid payment promise: %s", err)
+		}
+	}
+	return nil
+}
+
+// containsFibreStateMsg reports whether the tx carries a fibre message that
+// mutates escrow state/balance as soon as it executes, so proposal must replay
+// it before settling a later MsgPayForFibre. MsgPayForFibre (settled on its
+// own path) and MsgRequestWithdrawal (only locks funds, paid out later by the
+// BeginBlocker) are excluded.
+func containsFibreStateMsg(tx sdk.Tx) bool {
+	for _, msg := range tx.GetMsgs() {
+		switch msg.(type) {
+		case *fibretypes.MsgPaymentPromiseTimeout,
+			*fibretypes.MsgDepositToEscrow:
+			return true
+		}
+	}
+	return false
+}

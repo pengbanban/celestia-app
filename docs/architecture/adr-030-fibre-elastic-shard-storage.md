@@ -1,0 +1,345 @@
+# ADR 030: Fibre Elastic Shard Storage
+
+## Changelog
+
+- 2026-09-01: Initial draft
+- 2026-09-01: Stream object uploads and simplify the read path
+- 2026-09-02: Clarify Cloudflare R2 credentials
+- 2026-09-02: Record the in-memory cache follow-up
+- 2026-09-02: Recommend a 30-day object lifecycle safety net
+- 2026-09-02: Batch object deletion during pruning
+- 2026-09-02: Make conditional object writes idempotent
+- 2026-09-02: Define the shard-marker binary format
+- 2026-09-07: Route shard operations through `routedStorage`
+
+## Status
+
+Proposed
+
+## Summary
+
+Fibre shard capacity is limited by each validator's local disk. Demand increases require coordinated hardware changes before validators need the capacity.
+
+This ADR moves durable shard payloads to S3-compatible object storage. Object mode streams payloads to the provider without local shard writes.
+
+## Context
+
+Fibre currently stores shard payloads as flat files on each validator's local disk. This design makes local disk capacity the limit for Fibre shard storage.
+
+The server calls `Store.Put` before it signs a storage promise. This ADR keeps that order.
+
+### Scope
+
+This ADR changes these parts of Fibre:
+
+- The internal storage of shard payloads below `Store`.
+- The construction and configuration of local and object-storage backends.
+- The local staging directory for local mode.
+- The write, read, startup recovery, and prune flows for shard payloads.
+- The backend and payload size in each Pebble shard marker.
+
+This ADR does not change these parts:
+
+- The public `Store` method signatures.
+- The upload service, payment rules, or storage-promise format.
+- The `BlobShard` binary codec or the unit of stored data.
+- Any protobuf, consensus state, or governance parameter.
+- Client egress from Fibre servers.
+- The need for persistent local Pebble metadata.
+- The deployment of an independent read tier.
+
+## Decision
+
+Fibre will keep Pebble as its local metadata store. Fibre will store each durable shard payload in a local flat file or object storage.
+
+The first object-storage implementation will support Cloudflare R2 and AWS S3 through one S3-compatible backend. Cloudflare R2 is the expected provider.
+
+- **Object mode** streams encoded shards to object storage. Reads access object storage.
+- **Local mode** stores durable shards as flat files on the Fibre server disk.
+
+The governance-derived storage budget will continue to limit logical occupancy.
+
+Each Pebble shard marker will contain a version, the durable backend, and an 8-byte encoded payload size. The size lets Fibre calculate occupancy and freed capacity without object listing or metadata requests.
+
+Existing empty marker values will mean legacy local storage. The marker lets Fibre read and prune the correct backend after an operator changes the storage mode between node starts.
+
+## Detailed Design
+
+### Shard marker format
+
+An empty shard-marker value means legacy local storage. Fibre will get its payload size from the local file when required.
+
+Each non-empty version 1 marker will contain exactly 10 bytes:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 1 byte | Version: `0x01` |
+| 1 | 1 byte | Backend: `0x01` for local or `0x02` for object |
+| 2 | 8 bytes | Unsigned encoded payload size in big-endian order |
+
+The payload size will equal the number of bytes produced by `writeShardBinary`.
+
+Marker decoding will use these validation rules:
+
+- A version 1 marker must contain exactly 10 bytes.
+- The version and backend tag must be recognised.
+- The payload size must be greater than zero and no greater than `math.MaxInt64`.
+- A truncated, overlong, malformed, or unsupported marker is an integrity error.
+
+These rules apply to `Store.Get`, `Store.Has`, `Store.Size`, and `Store.PruneBefore`. A method must not select a backend from an invalid marker or modify that marker's payload or metadata. `Store.PruneBefore` skips invalid entries, continues pruning valid entries, and returns integrity errors after committing the valid metadata deletions.
+
+### Design overview
+
+```text
+Fibre server
+  └── Store
+      ├── Pebble metadata and prune index
+      └── routedStorage
+          ├── primary shardBackend
+          └── secondary shardBackend (optional)
+```
+
+`localBackend` and `objectBackend` implement `shardBackend`.
+
+`Store` will own Pebble metadata and one `routedStorage`. The router will own the primary and optional secondary backends.
+
+`Store` will not hold or select a `shardBackend` directly. New writes will use the primary backend. Existing operations will use the marker tag.
+
+Fibre will write each new shard to one durable backend. Local mode will use `localBackend`, and object mode will use `objectBackend`.
+
+Both durable backends will use the existing shard binary codec. One payload contains one validator-assigned `BlobShard` from one upload request ([`fibre/store_codec.go:15`](../../fibre/store_codec.go#L15)).
+
+### Write flow
+
+#### Object mode
+
+1. The server validates the upload, payment promise, assignment, and shard.
+2. `Store` calculates the exact encoded size without encoding the shard ([`fibre/store_codec.go:90`](../../fibre/store_codec.go#L90)).
+3. `Store` gets a marker for the primary backend from `routedStorage`.
+4. `Store` passes the marker and shard to `routedStorage.Put`.
+5. `objectBackend` streams `writeShardBinary` into the `PutObject` request body ([`fibre/store_codec.go:33`](../../fibre/store_codec.go#L33)).
+6. The request uses `If-None-Match: *` to prevent an overwrite.
+7. If `PutObject` succeeds, the object write is complete.
+8. If `PutObject` returns `PreconditionFailed`, `objectBackend` treats the object as already written.
+9. Any other object-write error fails the upload.
+10. `Store` commits the Pebble metadata with the `object` backend and encoded payload size.
+11. The server signs and returns the storage promise.
+
+Object storage is authoritative in object mode. Object mode does not write shard payloads to local disk.
+
+If the object write fails with an error other than `PreconditionFailed`, `Store` does not commit metadata or sign the storage promise.
+
+If the Pebble commit fails, `Store` passes the same marker to `routedStorage.Delete`. This routes cleanup to the backend that handled the write.
+
+#### Local mode
+
+Local mode will keep the current stage, publish, and Pebble commit flow ([`fibre/store.go:146`](../../fibre/store.go#L146)).
+
+The publish step atomically renames the staging file to its final path. The Pebble marker will record `local` and the encoded payload size.
+
+At startup, `routedStorage` removes incomplete local-mode staging files.
+
+### Read flow
+
+Pebble will return all shard markers that match the requested commitment. Each matching shard marker records the payload's durable backend.
+
+For each matching shard marker, `Store` will use this flow:
+
+1. Pass the marker to `routedStorage.Get`.
+2. `routedStorage` selects the configured backend from the marker tag.
+3. For a local marker, `localBackend` reads the local flat file.
+4. For an object marker, `objectBackend` reads the object with `GetObject`.
+5. If local storage returns `NotFound`, keep the marker for occupancy accounting and try the next matching shard marker.
+6. If object storage returns `NotFound`, keep the marker and try the next matching shard marker.
+7. If another durable-storage error occurs, record it and try the next matching shard marker.
+8. If no matching shard marker succeeds, return the recorded error, or `ErrStoreNotFound` if no other error occurred.
+
+Every read of an object-backed shard accesses object storage.
+
+The read flow keeps missing-file markers until pruning can release their recorded sizes.
+
+### Read latency concerns
+
+Object-backed reads add network and provider latency to the Fibre read path. This latency can be higher than local file latency.
+
+The implementation must measure read latency under the expected request rate. If recent reads require lower latency, a later ADR can add a cache for recent uploads.
+
+This ADR does not define the cache design or its storage medium.
+
+### Store integration
+
+The `Store` API will not change. `Store` will contain `routedStorage` and delegate shard payload operations to it.
+
+| Method | Behavior |
+|---|---|
+| `Store.Put` | Call `shards.Put` before the Pebble batch commit. |
+| `Store.Get` | Get matching shard markers from Pebble, then call `shards.Get` for each matching shard marker. |
+| `Store.Has` | Read Pebble first, then call `shards.Has` for the recorded durable backend. |
+| `Store.PruneBefore` | Call `shards.Delete` before removing the Pebble entries. |
+| `Store.Size` | Sum the sizes returned by `shards.size`; the router stats empty legacy markers. |
+| `Store.DiskAvailable` | Report local space for Pebble, local payloads, and local staging files. |
+
+`Store` owns Pebble and `routedStorage` ([`fibre/store.go:63`](../../fibre/store.go#L63)). The router contains backends and hides marker routing from `Store`.
+
+### Backend construction
+
+`NewStore` will always open Pebble and `localBackend`.
+
+`NewStore` will open `objectBackend` in object mode. It will also open this backend while live markers record `object`.
+
+Startup fails if required object-storage settings are missing or invalid, including in local mode with object markers.
+
+In local mode, `routedStorage` will use `localBackend` as primary. It will use `objectBackend` as secondary when object access is configured.
+
+In object mode, `routedStorage` will use `objectBackend` as primary and `localBackend` as secondary. Startup reconciliation will still clear local staging files.
+
+The primary backend will support these values:
+
+- `local`: Store new shards in `localBackend`. This value is the default.
+- `object`: Stream new shards to `objectBackend`.
+
+Tests can inject `shardBackend` implementations into `routedStorage`. `NewMemoryStore` will use `localBackend` with the existing in-memory filesystem.
+
+The object backend will use provider-neutral configuration:
+
+```toml
+storage_backend = "local" # local or object
+
+[object_storage]
+endpoint = "https://<account-id>.r2.cloudflarestorage.com"
+region = "auto"
+bucket = "fibre-shards"
+prefix = "fibre"
+```
+
+Operators must create the bucket before Fibre starts. Operators will configure the bucket and object-key prefix.
+
+Fibre will derive the chain ID and validator consensus address (`celestiavalcons...`).
+
+For Cloudflare R2, operators will create an R2 API token with read and write access to the selected bucket. Fibre will read its Access Key ID and Secret Access Key through the AWS SDK credential chain. This chain includes `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. These variables contain Cloudflare credentials when the endpoint is R2.
+
+The implementation will use the existing AWS SDK for Go v2 dependency ([`go.mod:21`](../../go.mod#L21)).
+
+### Object layout
+
+Each object key will use this format:
+
+```text
+<prefix>/<chain-id>/<validator-consensus-address>/shards/<commitment>-<promise-hash>
+```
+
+The prefix is part of each key. The chain ID prevents collisions when one bucket contains several networks.
+
+The validator consensus address prevents collisions when one operator uses the bucket for several validators. Each object will contain one complete validator-assigned `BlobShard`.
+
+### Prune flow
+
+Pebble will continue to select expired entries from its prune index ([`fibre/store.go:388`](../../fibre/store.go#L388)).
+
+`Store` will pass expired markers to `routedStorage`. The router will group the payloads by durable backend.
+
+1. Delete local payloads individually.
+2. Delete object payloads with `DeleteObjects` in batches of up to 1,000 keys.
+3. Treat a missing payload as a successful deletion.
+4. Remove Pebble metadata only for payloads that were deleted or already missing.
+
+`DeleteObjects` can report errors for individual keys. `Store` will keep the corresponding Pebble entries so a later prune cycle can retry them.
+
+For a legacy empty marker, `routedStorage` will get the size from the local file before deletion.
+
+Fibre protocol pruning will remain responsible for normal shard expiration. Operators should configure a provider lifecycle rule that deletes objects after at least 30 days.
+
+This rule will remove orphaned objects if Fibre pruning stops. It must not replace Fibre pruning because provider rules cannot read promise expiration or Pebble prune markers. Operators must increase the lifecycle period before the protocol allows a shard to remain live for 30 days or longer.
+
+### Capacity accounting
+
+Fibre will sum marker sizes and stat local files for empty legacy markers. Both modes will exclude Pebble bytes and preserve the governance budget.
+
+`DiskAvailable` will continue to monitor local filesystem space.
+
+### Storage migration
+
+A storage-mode change will not move existing payloads. Live shards can exist in both durable backends during one retention window.
+
+- Local to object: New uploads use object storage, while old markers continue to use local storage.
+- Object to local: New uploads use local storage, while old markers continue to use object storage.
+
+Every marker records where its payload lives. Fibre reads and prunes that backend after the operator changes the write mode.
+
+During an object-to-local migration, operators must keep the object-storage configuration and credentials until all object-backed shards expire.
+
+#### Binary downgrade
+
+A direct binary downgrade is not possible while object-backed shards remain live. Old Fibre versions read every marker as a local flat-file reference.
+
+Before a downgrade, an external utility must copy each live object to its legacy local path. The utility must also clear each copied marker value.
+
+## Alternative Approaches
+
+### Preserve empty Pebble marker values
+
+A router could keep all marker values empty. It could use a primary durable backend and an optional secondary durable backend.
+
+Reads would use the primary backend. They would use the secondary backend after `NotFound` from the primary backend.
+
+After a different primary error, Fibre would record the error and try the secondary backend. If the secondary misses, Fibre would return the primary error.
+
+Fibre would not call `Has` before `Get`, because this sequence adds an object-storage request.
+
+During migration, pruning would attempt both durable backends before it removes Pebble metadata. The secondary-backend configuration could remain after old shards expire.
+
+This approach preserves the Pebble marker format. It adds backend requests and requires backend listing for startup size accounting.
+
+## Consequences
+
+### Positive
+
+- Object storage removes local disk as the durable shard-capacity limit.
+- Object-mode uploads do not write shard payloads to local disk.
+- Marker routing supports storage-mode changes between node starts.
+- Marker sizes avoid object listing and metadata requests for capacity accounting.
+- Fibre keeps authority over the complete shard lifecycle.
+
+### Negative
+
+- Every accepted object-mode upload waits for `PutObject`.
+- An object-storage outage stops new object-mode uploads and object-backed reads.
+- Object-backed reads add network and provider latency.
+- Object operations create provider charges.
+- Pebble remains the only metadata index for object-backed shards.
+- A binary downgrade requires an external migration utility while object-backed shards remain live.
+
+### Risks and mitigations
+
+| Area | Risk | Mitigation or limit |
+|---|---|---|
+| Write latency | An object upload can exceed the current upload timeout. | Measure the complete write path against the timeout. |
+| Provider availability | An outage stops new uploads and object-backed reads. | Fibre reports the provider error and keeps its Pebble markers. |
+| Read latency | Object storage adds latency to every object-backed read. | Measure object-read latency and define request limits. |
+| Request cost | Repeated downloads can create unbounded object-read charges. | Object-read limiting is deferred to [PROTOCO-2621](https://linear.app/celestia/issue/PROTOCO-2621). Measure traffic and costs before selecting a policy. |
+| Binary downgrade | Old Fibre cannot read live object-backed shards. | Copy live objects to legacy local paths before downgrade. |
+| Disaster recovery | Loss of Pebble removes the object index. | Complete disaster recovery is outside this ADR. |
+| Provider lifecycle rules | A short lifecycle can delete a promised shard. | Use at least 30 days as a safety net and review this period when protocol retention limits change. |
+
+## FLUP
+
+### Bounded in-memory cache
+
+The first cache option to evaluate will be a bounded, write-through in-memory cache for object-backed shards. It will retain only the most recent successful shard uploads. This cache will target reads that follow shortly after an upload without adding local SSD writes.
+
+- Cache only successful new object-mode uploads.
+- Use a strict byte limit and evict the oldest uploads first.
+- Do not populate the cache after object-storage reads. This prevents arbitrary reads from displacing recent uploads.
+- Treat the cache as optional and non-durable. It will start empty after a restart.
+- Measure shard sizes, the hot-read window, cache hit rate, and memory use before selecting a default limit.
+
+## References
+
+- [R2 S3 API compatibility](https://developers.cloudflare.com/r2/api/s3/api/)
+- [R2 consistency model](https://developers.cloudflare.com/r2/reference/consistency/)
+- [R2 durability](https://developers.cloudflare.com/r2/reference/durability/)
+- [R2 limits](https://developers.cloudflare.com/r2/platform/limits/)
+- [R2 pricing](https://developers.cloudflare.com/r2/pricing/)
+- [R2 object lifecycle rules](https://developers.cloudflare.com/r2/buckets/object-lifecycles/)
+- [AWS S3 pricing](https://aws.amazon.com/s3/pricing/)
+- [AWS SDK for Go with R2](https://developers.cloudflare.com/r2/examples/aws/aws-sdk-go/)

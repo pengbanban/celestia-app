@@ -1,0 +1,54 @@
+name: docker-build-publish
+
+# Trigger on push events to main/release branches and new semantic version
+# tags. PR and merge_group triggers are omitted because the reusable pipeline
+# only publishes images on push to main, making PR/MQ runs build-only waste.
+# The merge queue builds the e2e image (docker/e2e.Dockerfile), which shares the
+# runtime stage; the full multiplexer.Dockerfile build runs nightly.
+on:
+  push:
+    branches:
+      - "main"
+      - "v*"
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "The checkout reference (ie tag, branch, sha)"
+        required: true
+        type: string
+
+jobs:
+  docker-standalone-build:
+    permissions:
+      contents: write
+      packages: write
+    uses: celestiaorg/.github/.github/workflows/reusable_dockerfile_pipeline.yml@33bbeb98fdf8d910a236e365b5f013cdfb81c082 #v0.6.5
+    with:
+      dockerfile: docker/standalone.Dockerfile
+      checkout_ref: ${{ github.event.inputs.ref }}
+      packageName: celestia-app-standalone
+    secrets: inherit
+
+  docker-multiplexer-build:
+    permissions:
+      contents: write
+      packages: write
+    uses: celestiaorg/.github/.github/workflows/reusable_dockerfile_pipeline.yml@33bbeb98fdf8d910a236e365b5f013cdfb81c082 #v0.6.5
+    with:
+      dockerfile: docker/multiplexer.Dockerfile
+      checkout_ref: ${{ github.event.inputs.ref }}
+      packageName: celestia-app
+    secrets: inherit
+
+  docker-txsim-build:
+    permissions:
+      contents: write
+      packages: write
+    uses: celestiaorg/.github/.github/workflows/reusable_dockerfile_pipeline.yml@33bbeb98fdf8d910a236e365b5f013cdfb81c082 #v0.6.5
+    with:
+      dockerfile: docker/txsim/Dockerfile
+      packageName: txsim
+      checkout_ref: ${{ github.event.inputs.ref }}
+    secrets: inherit

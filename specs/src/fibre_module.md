@@ -1,0 +1,470 @@
+# Fibre SDK Module `x/fibre`
+
+## Abstract
+
+The `x/fibre` module is the escrow and settlement module for Fibre payment promises. Users deposit funds into module-controlled escrow accounts, sign off-chain `PaymentPromise` values for specific blobs, and later settle those promises on-chain either through `MsgPayForFibre` with validator signatures or through `MsgPaymentPromiseTimeout` after the promise expires.
+
+The module manages escrow balances, delayed withdrawals, payment deduction, processed-payment replay protection, stateful payment-promise validation, events, queries, genesis state, and module parameters. It does not receive blob bytes and it does not directly build the data square; the app square builder recognizes valid standalone `MsgPayForFibre` transactions and synthesizes the corresponding Fibre system blob for square inclusion.
+
+## Flow
+
+1. The escrow owner funds an escrow account with `MsgDepositToEscrow`.
+2. The escrow owner creates a signed `PaymentPromise` off-chain. The promise names the chain, validator-set height, namespace, blob size, blob version, commitment, creation timestamp, escrow-owner secp256k1 public key, and secp256k1 signature.
+3. A validator or Fibre server performs stateless validation locally and can call `Query/ValidatePaymentPromise` for stateful validation. The query checks freshness, expiry, height window, replay status, escrow existence, and total escrow balance. With the default local promise cache enabled, it also verifies the owner signature and reserves a local budget; see [Queries](#queries).
+4. A normal settlement submits `MsgPayForFibre` containing exactly one payment promise and validator signatures. The ante handler verifies validator signatures in CheckTx and ProcessProposal. The message server validates the promise, deducts the payment from escrow, records the promise hash as processed, and emits `EventPayForFibre`.
+5. A timeout settlement submits `MsgPaymentPromiseTimeout` after `creation_timestamp + payment_promise_timeout`. The message server validates the promise and state, skips normal expiry and height-window checks, deducts the same payment amount from escrow, records the promise hash as processed, and emits `EventPaymentPromiseTimeout`.
+6. At the beginning of each block, the module advances the promise freshness floor, processes available withdrawals, and prunes processed payments outside the retention window.
+
+### Fibre Blob Settlement
+
+```mermaid
+sequenceDiagram
+    participant C as Escrow owner / client
+    participant FS as Fibre server / validator
+    participant Q as x/fibre query service
+    participant A as App proposal path
+    participant M as x/fibre msg server
+    participant P as Timeout processor
+
+    C->>M: MsgDepositToEscrow(amount)
+    M->>M: Create or update escrow account
+
+    C->>C: Create v0 blob, commitment, and signed PaymentPromise
+    loop Assigned validators
+        C->>FS: UploadShard(PaymentPromise, assigned rows, proofs, RLC)
+        FS->>FS: Stateless promise validation and assignment check
+        FS->>Q: ValidatePaymentPromise(PaymentPromise)
+        Q-->>FS: expiration_time, shard_retention
+        FS->>FS: Store shard until max(expiration, creation + retention)
+        FS-->>C: Validator signature over PaymentPromise sign bytes
+    end
+
+    C->>A: Tx containing one MsgPayForFibre
+    A->>A: Verify signatures and settlement on proposal state
+    A->>A: Append PFF tx and synthesize Fibre system blob
+    A->>M: Execute MsgPayForFibre
+    M->>M: Validate promise and state
+    M->>M: Deduct escrow and record processed payment
+    M-->>C: EventPayForFibre
+
+    P->>M: MsgPaymentPromiseTimeout(PaymentPromise)
+    M->>M: Timeout validation, escrow deduction, processed-payment record
+    M-->>P: EventPaymentPromiseTimeout
+    Note over M,A: Timeout settlement does not synthesize a Fibre system blob
+```
+
+`ValidatePaymentPromise` checks chain state and, with the default local promise cache enabled, verifies and reserves the promise locally. The cache is used only by the query, never by consensus execution. The Fibre server and `MsgPayForFibre` handler also validate the escrow-owner signature.
+
+### Withdrawal Processing
+
+```mermaid
+sequenceDiagram
+    participant C as Escrow owner
+    participant M as x/fibre msg server
+    participant B as BeginBlocker
+    participant Bank as Bank keeper
+
+    C->>M: MsgRequestWithdrawal(amount)
+    M->>M: Check escrow and available_balance
+    M->>M: Subtract amount from available_balance
+    M->>M: Store withdrawal by signer and available time
+    Note over M: Total balance remains escrowed until BeginBlock
+
+    B->>M: processAvailableWithdrawals()
+    M->>M: Iterate withdrawals available at block time
+    M->>M: Check total balance covers withdrawal
+    M->>Bank: Send coins from fibre module account to signer
+    alt bank send succeeds
+        M->>M: Subtract amount from total balance and store escrow
+        M->>M: Delete withdrawal from both indexes
+        M-->>C: EventWithdrawFromEscrowExecuted
+    else bank send fails
+        M->>M: Log error and leave escrow state and withdrawal unchanged
+    end
+
+    B->>M: pruneProcessedPayments()
+    M->>M: Delete replay records older than retention window
+```
+
+## State
+
+The module store key is `fibre`. Module params are stored under the raw key `params`. The other state objects use byte prefixes from `x/fibre/types/keys.go`: escrow accounts use `0x02`, withdrawals-by-signer use `0x03`, withdrawals-by-available-time use `0x04`, processed-payments-by-hash use `0x05`, and processed-payments-by-time use `0x06`. The promise freshness floor is stored under `0x07`.
+
+### EscrowAccount
+
+An escrow account is keyed by the escrow signer address with `0x02 || signer`, where `signer` is the canonical bech32 string of the address (`sdk.AccAddress.String()`); a message signer given in the uppercase bech32 form resolves to the same account. `balance` is the total amount held in the module account for that signer and `available_balance` is the amount that has not been reserved by pending withdrawal requests.
+
+```proto
+message EscrowAccount {
+  string signer = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  cosmos.base.v1beta1.Coin balance = 2 [(gogoproto.nullable) = false];
+  cosmos.base.v1beta1.Coin available_balance = 3 [(gogoproto.nullable) = false];
+}
+```
+
+Payments are validated against and deducted from total `balance`, not only `available_balance`. If a payment spends funds that are currently locked in pending withdrawals, the module reduces or deletes those pending withdrawals so that the escrow state remains consistent.
+
+### Withdrawal
+
+Withdrawal requests are stored in two indexes. The signer index key is `0x03 || signer || "/" || sdk.FormatTimeBytes(requested_timestamp)` and the availability index key is `0x04 || sdk.FormatTimeBytes(available_timestamp) || "/" || sdk.FormatTimeBytes(requested_timestamp) || "/" || signer`. The requested timestamp is included in the availability key so two requests from the same signer that share an `available_timestamp` after a `withdrawal_delay` parameter change do not overwrite each other.
+
+```proto
+message Withdrawal {
+  string signer = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  cosmos.base.v1beta1.Coin amount = 2 [(gogoproto.nullable) = false];
+  google.protobuf.Timestamp requested_timestamp = 3 [(gogoproto.nullable) = false, (gogoproto.stdtime) = true];
+  google.protobuf.Timestamp available_timestamp = 4 [(gogoproto.nullable) = false, (gogoproto.stdtime) = true];
+}
+```
+
+`MsgRequestWithdrawal` immediately subtracts the amount from `available_balance` and records a withdrawal with `available_timestamp = block_time + withdrawal_delay`. The total escrow `balance` is not reduced until BeginBlock processes the withdrawal.
+
+### ProcessedPayment
+
+Processed payments are stored for replay protection and pruning. The hash index key is `0x05 || payment_promise_hash` and the time index key is `0x06 || sdk.FormatTimeBytes(processed_at) || "/" || payment_promise_hash`.
+
+```proto
+message ProcessedPayment {
+  bytes payment_promise_hash = 1;
+  google.protobuf.Timestamp processed_at = 2 [(gogoproto.nullable) = false, (gogoproto.stdtime) = true];
+}
+```
+
+`MsgPayForFibre` and `MsgPaymentPromiseTimeout` both compute the internal payment-promise hash and store a `ProcessedPayment` at the current block time. BeginBlock prunes processed payments whose `processed_at` is outside the processed-payment retention window (`Params.PaymentPromiseRetentionWindow()`).
+
+### GenesisState
+
+Genesis contains params, escrow accounts, withdrawals, processed payments, and the promise freshness floor.
+
+```proto
+message GenesisState {
+  Params params = 1 [(gogoproto.nullable) = false];
+  repeated EscrowAccount escrow_accounts = 2 [(gogoproto.nullable) = false];
+  repeated Withdrawal withdrawals = 3 [(gogoproto.nullable) = false];
+  repeated ProcessedPayment processed_payments = 4 [(gogoproto.nullable) = false];
+  google.protobuf.Timestamp promise_freshness_floor = 5 [(gogoproto.nullable) = false, (gogoproto.stdtime) = true];
+}
+```
+
+Genesis validation checks params, requires escrow and withdrawal signers to be valid bech32 addresses in canonical form, rejects duplicate escrow signers, requires escrow balances to be valid with `available_balance <= balance`, requires withdrawals to have a positive valid amount, and nonzero requested timestamp, and requires processed payments to have a non-empty unique hash and nonzero `processed_at`. `InitGenesis` also checks the escrow and withdrawal signers and panics on failure, so a non-canonical signer cannot start a chain.
+
+## PaymentPromise
+
+`PaymentPromise` is the on-chain protobuf representation of an off-chain promise signed by the escrow owner. The signer public key is a concrete `cosmos.crypto.secp256k1.PubKey`, not an `Any`.
+
+```proto
+message PaymentPromise {
+  string chain_id = 1;
+  int64 height = 2;
+  bytes namespace = 3;
+  uint32 blob_size = 4;
+  uint32 blob_version = 5;
+  bytes commitment = 6;
+  google.protobuf.Timestamp creation_timestamp = 7 [(gogoproto.nullable) = false, (gogoproto.stdtime) = true];
+  cosmos.crypto.secp256k1.PubKey signer_public_key = 8 [(gogoproto.nullable) = false];
+  bytes signature = 9;
+}
+```
+
+### Sign Bytes And Hash
+
+The internal `fibre.PaymentPromise` canonical payload bytes are:
+
+```text
+stripped_sign_bytes =
+  signer_public_key_compressed_33 ||
+  namespace_29 ||
+  big_endian_u32(blob_size) ||
+  commitment_32 ||
+  big_endian_u32(blob_version) ||
+  big_endian_u64(height) ||
+  creation_timestamp.UTC().MarshalBinary()
+```
+
+The bytes signed by the escrow owner and by validators are `core.RawBytesMessageSignBytes(chain_id, "fibre/pp:v0", stripped_sign_bytes)`. The chain ID and `"fibre/pp:v0"` prefix are applied by CometBFT raw-bytes domain separation and are not raw-concatenated into `stripped_sign_bytes`.
+
+The payment-promise hash used for replay protection is:
+
+```text
+SHA256(sign_bytes || signature)
+```
+
+The internal `Hash` method requires a non-empty signature before computing this hash.
+
+### Stateless Validation
+
+The SDK `PaymentPromise.ValidateBasic` checks that `chain_id` is non-empty, `namespace` is exactly 29 bytes and valid for blob use, `blob_size` is positive, `commitment` is exactly 32 bytes, `blob_version` is `0`, `height` is positive, `creation_timestamp` is nonzero, `signer_public_key.key` is exactly 33 bytes, and `signature` is non-empty.
+
+The message handlers also convert the protobuf value to `fibre.PaymentPromise` and call the internal `Validate` method. Internal validation requires a non-nil 33-byte secp256k1 signer key, non-empty chain ID no longer than 20 bytes, positive upload size, nonzero creation timestamp, a 64-byte compact secp256k1 signature, positive height, and a valid signature over the canonical sign bytes.
+
+### Stateful Validation
+
+`ValidatePaymentPromiseStateful` checks the current chain state and returns the promise expiration time on success. Both paths require the promise chain ID to match the executing chain. They require `creation_timestamp` to be strictly after `max(block_time - withdrawal_delay, promise_freshness_floor)` and no later than `block_time + 10m`. The persisted floor only advances, preventing an increased withdrawal delay from reviving a promise whose replay record was pruned. Normal validation rejects promises at or after `creation_timestamp + payment_promise_timeout`, rejects promises more than `payment_promise_height_window` blocks behind the current height, rejects promises more than one block ahead of the current height, rejects already processed promises, requires an escrow account for `sdk.AccAddress(signer_public_key.Address())`, and requires total escrow `balance` to cover the payment amount.
+
+`ValidatePaymentPromiseStatefulForTimeout` performs the same checks except that it skips the normal expiration check and the normal height-window checks. Timeout processing still enforces the freshness cutoff and future-timestamp limit, still rejects already processed promises, still requires an escrow account, and still requires total escrow `balance` to cover the payment amount.
+
+## Payment Amount
+
+`MsgPayForFibre` and `MsgPaymentPromiseTimeout` both charge the same amount. The implementation estimates gas with a standalone formula and converts that gas amount to a coin in `appconsts.BondDenom` (`utia`).
+
+```text
+gas = 650000 + 45000 * ceil(blob_size / 262144)
+amount = gas utia
+```
+
+If `EstimateGasForPayForFibre` is called with `blob_size == 0`, it returns only the fixed cost of `650000`, although valid payment promises require a positive blob size. This payment formula is standalone and does not depend on any per-byte gas parameter.
+
+## Messages
+
+### MsgDepositToEscrow
+
+```proto
+message MsgDepositToEscrow {
+  option (cosmos.msg.v1.signer) = "signer";
+  string signer = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  cosmos.base.v1beta1.Coin amount = 2 [(gogoproto.nullable) = false];
+}
+```
+
+`ValidateBasic` requires a valid bech32 signer address and a valid positive coin in the bond denom (`utia`). The handler gets or creates the escrow account, sends the coin from the signer account to the `fibre` module account, adds the amount to both `balance` and `available_balance`, stores the escrow account, and emits `EventDepositToEscrow`.
+
+### MsgRequestWithdrawal
+
+```proto
+message MsgRequestWithdrawal {
+  option (cosmos.msg.v1.signer) = "signer";
+  string signer = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  cosmos.base.v1beta1.Coin amount = 2 [(gogoproto.nullable) = false];
+}
+```
+
+`ValidateBasic` requires a valid bech32 signer address and a valid positive coin in the bond denom (`utia`). The handler requires an existing escrow account, requires `available_balance >= amount`, rejects a key collision with an existing withdrawal at the current block timestamp, stores a withdrawal with `requested_timestamp = block_time` and `available_timestamp = block_time + withdrawal_delay`, subtracts the amount from `available_balance`, and emits `EventWithdrawFromEscrowRequest`.
+
+### MsgPayForFibre
+
+```proto
+message MsgPayForFibre {
+  option (cosmos.msg.v1.signer) = "signer";
+  string signer = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  PaymentPromise payment_promise = 2 [(gogoproto.nullable) = false];
+  repeated bytes validator_signatures = 3;
+}
+```
+
+`ValidateBasic` requires a valid transaction signer, a valid payment promise by `PaymentPromise.ValidateBasic`, and at least one validator signature. The handler converts the promise to the internal Fibre type, verifies the internal stateless validation and escrow-owner secp256k1 signature, runs normal stateful validation, hashes the promise, derives the escrow signer from `payment_promise.signer_public_key`, deducts the calculated payment amount from escrow, stores the processed payment, and emits `EventPayForFibre`.
+
+Validator-signature verification runs in the ante handler in CheckTx and ProcessProposal, with a cache keyed by the payment promise and validator signatures, excluding the transaction submitter. CheckTx and recheck also run read-only stateful promise validation to keep unsettleable PFFs out of the mempool; proposal execution remains the authoritative settlement check. It is skipped during simulation and FinalizeBlock; the message server does not repeat it. Deterministic signature gas is charged separately. See [`x/fibre/ante/ante.go`](../../x/fibre/ante/ante.go).
+
+Signatures are positional in the historical validator set. A slice longer than that set is rejected, including trailing empty entries. Empty entries are skipped. Verification stops once verified signatures reach `floor(2 * total_voting_power / 3)`, so later entries within the allowed slice length are not necessarily checked. Exactly two thirds can pass; there is no separate validator-count threshold. `EventPayForFibre.validator_count` is the submitted slice length, including empty entries. See [`validateValidatorSignatures`](../../x/fibre/keeper/msg_server.go) and [`SignatureSet`](../../fibre/validator/signature_set.go).
+
+A validator signature verifies under ZIP-215: the cofactored equation
+`[8][s]B = [8]R + [8][k]A`, with `S` required to be reduced modulo the group
+order, and with non-canonical and small-order encodings of `A` and `R`
+permitted. This is the rule CometBFT applies to every other Ed25519 signature
+it checks, and the only one batch verification can implement. It accepts
+strictly more signatures than the cofactorless equation `[s]B = R + [k]A`; a
+re-implementation that checks the cofactorless equation will reject
+certificates this rule accepts.
+
+Payment deduction first requires total escrow `balance >= payment_amount`. It subtracts the full payment from total `balance`, subtracts `min(available_balance, payment_amount)` from `available_balance`, and if the payment uses funds that were locked in pending withdrawals, it calls `ReduceWithdrawalsForPayment` to delete or reduce the signer's pending withdrawals in signer-index iteration order.
+
+The app proposal path synthesizes data-square metadata for accepted PFF transactions; see [Data Square Construction](#data-square-construction). The message handler itself does not insert a blob into the square.
+
+### MsgPaymentPromiseTimeout
+
+```proto
+message MsgPaymentPromiseTimeout {
+  option (cosmos.msg.v1.signer) = "signer";
+  string signer = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  PaymentPromise payment_promise = 2 [(gogoproto.nullable) = false];
+}
+```
+
+`ValidateBasic` requires a valid transaction signer and a valid payment promise by `PaymentPromise.ValidateBasic`. The signer is the processor and can be any account. The handler converts and internally validates the promise, runs timeout stateful validation, requires `block_time >= creation_timestamp + payment_promise_timeout`, calculates and deducts the same payment amount used by `MsgPayForFibre`, stores the processed payment, and emits `EventPaymentPromiseTimeout`. Timeout processing does not require validator signatures and does not create a data-square system blob.
+
+### MsgUpdateFibreParams
+
+```proto
+message MsgUpdateFibreParams {
+  option (cosmos.msg.v1.signer) = "authority";
+  string authority = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  Params params = 2 [(gogoproto.nullable) = false];
+}
+```
+
+`ValidateBasic` requires a valid authority address and valid params. The handler requires `authority == keeper.GetAuthority()`, requires all params to be supplied and valid, stores the new params, and emits `EventUpdateFibreParams`.
+
+## Data Square Construction
+
+The SDK module does not insert commitments or blobs into the data square. Data-square metadata is synthesized during app square construction in the app proposal path; no `fibre` build tag is required.
+
+A valid PayForFibre transaction for square construction is a plain SDK transaction that contains exactly one `MsgPayForFibre` and no other messages. PrepareProposal separates these transactions from normal SDK transactions, drops mixed or multi-PFF transactions, skips transactions after `MaxPayForFibreMessages`, and appends accepted Fibre transactions to the square builder. ProcessProposal rejects a block if a plain SDK transaction contains multiple `MsgPayForFibre` messages, mixes `MsgPayForFibre` with other messages, or causes the block to exceed `MaxPayForFibreMessages`.
+
+The current production constant is:
+
+```go
+const MaxPayForFibreMessages = 200
+```
+
+`x/fibre/types.TryParseFibreTx` parses the `MsgPayForFibre`, requires a present `payment_promise`, decodes the promise namespace, decodes the transaction `signer` bech32 address to raw bytes, and builds the system blob with:
+
+```go
+share.NewV2Blob(namespace, payment_promise.blob_version, payment_promise.commitment, signer_bytes)
+```
+
+Therefore the synthesized system blob includes the promise namespace, blob version, commitment, and raw message signer bytes. The v2 blob payload represents the blob version and 32-byte commitment; it is not just the commitment by itself. The PayForFibre transaction bytes are encoded under the PayForFibre namespace while the synthesized system blob is appended as the associated Fibre system blob by the square builder.
+
+### Payment Settlement Destination
+
+Both settlement paths (`MsgPayForFibre` and `MsgPaymentPromiseTimeout`) charge the escrow owner the gas-based payment amount. This charge is distinct from the fee paid for the settlement transaction itself: the transaction fee is paid by the broadcaster and distributed via the ante handler, whereas the escrow charge is the data-availability fee owed by the escrow owner for the Fibre blob.
+
+The charged amount is transferred from the fibre module account to the `fee_collector` module account. From there it follows the standard fee pipeline in `x/distribution`, paying validators (proportional to stake) and their delegators, with the community tax applied. This mirrors how regular blob fees (`MsgPayForBlobs`) are settled, and keeps the funds from being stranded in the fibre module account.
+
+The destination is independent of which validators signed the PaymentPromise. This is required because the timeout path carries no validator signatures, so a signer-dependent destination could not settle both paths consistently.
+
+## Automatic State Transitions
+
+`BeginBlocker` first advances the persisted freshness floor to `max(previous_floor, block_time - withdrawal_delay)`, then runs `processAvailableWithdrawals` and `pruneProcessedPayments`.
+
+`processAvailableWithdrawals` iterates the withdrawals-by-available-time index in time order, stops when it reaches a future `available_timestamp`, parses the signer from the key, loads the withdrawal, loads the escrow account, checks that total `balance` covers the withdrawal, sends coins from the `fibre` module account to the signer account, and only after a successful send subtracts the withdrawal amount from total `balance`, stores the escrow account, deletes the withdrawal from both indexes, and emits `EventWithdrawFromEscrowExecuted`. If key parsing, signer parsing, escrow lookup, balance sufficiency, bank send, or event emission fails, the implementation logs the error and continues; the bank send runs before escrow state is updated so a failed send leaves the escrow account and the pending withdrawal unchanged for a safe retry.
+
+`pruneProcessedPayments` computes `cutoff_time = block_time - Params.PaymentPromiseRetentionWindow()`, iterates the processed-payments-by-time index in time order, stops when `processed_at` is after the cutoff, deletes each pruned processed payment from both indexes, and emits `EventProcessedPaymentPruned`.
+
+## Events
+
+```proto
+message EventDepositToEscrow {
+  string signer = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  cosmos.base.v1beta1.Coin amount = 2 [(gogoproto.nullable) = false];
+}
+
+message EventWithdrawFromEscrowRequest {
+  string signer = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  cosmos.base.v1beta1.Coin amount = 2 [(gogoproto.nullable) = false];
+  google.protobuf.Timestamp requested_at = 3 [(gogoproto.nullable) = false, (gogoproto.stdtime) = true];
+  google.protobuf.Timestamp available_at = 4 [(gogoproto.nullable) = false, (gogoproto.stdtime) = true];
+}
+
+message EventWithdrawFromEscrowExecuted {
+  string signer = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  cosmos.base.v1beta1.Coin amount = 2 [(gogoproto.nullable) = false];
+}
+
+message EventPayForFibre {
+  string signer = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  bytes namespace = 2;
+  bytes commitment = 3;
+  uint32 validator_count = 4;
+}
+
+message EventPaymentPromiseTimeout {
+  string processor = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  string escrow_signer = 2 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  bytes payment_promise_hash = 3;
+}
+
+message EventUpdateFibreParams {
+  string signer = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  Params params = 2 [(gogoproto.nullable) = false];
+}
+
+message EventProcessedPaymentPruned {
+  bytes payment_promise_hash = 1;
+  google.protobuf.Timestamp processed_at = 2 [(gogoproto.nullable) = false, (gogoproto.stdtime) = true];
+}
+```
+
+`EventPayForFibre.signer` is the escrow signer derived from the payment promise public key, not necessarily the transaction signer. `EventPaymentPromiseTimeout.processor` is the transaction signer that submitted the timeout, while `escrow_signer` is derived from the payment promise public key.
+
+## Queries
+
+```proto
+service Query {
+  rpc Params(QueryParamsRequest) returns (QueryParamsResponse) {
+    option (google.api.http).get = "/fibre/v1/params";
+  }
+  rpc EscrowAccount(QueryEscrowAccountRequest) returns (QueryEscrowAccountResponse) {
+    option (google.api.http).get = "/fibre/v1/escrow-account/{signer}";
+  }
+  rpc Withdrawals(QueryWithdrawalsRequest) returns (QueryWithdrawalsResponse) {
+    option (google.api.http).get = "/fibre/v1/withdrawals/{signer}";
+  }
+  rpc IsPaymentProcessed(QueryIsPaymentProcessedRequest) returns (QueryIsPaymentProcessedResponse) {
+    option (google.api.http).get = "/fibre/v1/is-payment-processed/{promise_hash}";
+  }
+  rpc ValidatePaymentPromise(QueryValidatePaymentPromiseRequest) returns (QueryValidatePaymentPromiseResponse) {
+    option (google.api.http) = {
+      post: "/fibre/v1/validate-payment-promise",
+      body: "*"
+    };
+  }
+}
+```
+
+`Params` returns the current params. `EscrowAccount` returns an escrow account and a `found` bool. `Withdrawals` returns withdrawals for a signer; the protobuf request and response contain pagination fields, but the current query handler ignores pagination and returns all matching withdrawals with an empty pagination response. `IsPaymentProcessed` returns `processed_at` and `found`. `ValidatePaymentPromise` first performs stateful validation. With `fibre-promise-cache` enabled (the app default), it additionally verifies the signature and reserves the payment amount in a validator-local, in-memory cache keyed by promise hash. Reservations account for other pending promises against available escrow, and repeat reservations are idempotent. This cache is not consensus state and is not used by message handlers or proposal execution. With the cache disabled, the query performs only stateful validation; callers must still do stateless validation. An invalid promise returns a gRPC error rather than `is_valid = false`; local budget rejection returns `ResourceExhausted`.
+
+```proto
+message QueryValidatePaymentPromiseResponse {
+  bool is_valid = 1;
+  google.protobuf.Timestamp expiration_time = 2 [(gogoproto.stdtime) = true];
+  google.protobuf.Duration shard_retention = 3 [(gogoproto.stdduration) = true, (gogoproto.nullable) = false];
+}
+```
+
+On success, `ValidatePaymentPromise` returns `is_valid = true` and `expiration_time = creation_timestamp + payment_promise_timeout`, and the current `shard_retention`.
+
+## Parameters
+
+```proto
+message Params {
+  google.protobuf.Duration withdrawal_delay = 1 [(gogoproto.moretags) = "yaml:\"withdrawal_delay\"", (gogoproto.stdduration) = true, (gogoproto.nullable) = false];
+  google.protobuf.Duration payment_promise_timeout = 2 [(gogoproto.moretags) = "yaml:\"payment_promise_timeout\"", (gogoproto.stdduration) = true, (gogoproto.nullable) = false];
+  uint64 payment_promise_height_window = 3 [(gogoproto.moretags) = "yaml:\"payment_promise_height_window\""];
+  google.protobuf.Duration shard_retention = 4 [(gogoproto.moretags) = "yaml:\"shard_retention\"", (gogoproto.stdduration) = true, (gogoproto.nullable) = false];
+  uint64 full_stake_storage_budget = 5 [(gogoproto.moretags) = "yaml:\"full_stake_storage_budget\""];
+}
+```
+
+| Parameter | Default | Validation | Current use |
+| --- | --- | --- | --- |
+| `withdrawal_delay` | `24h` | Must be between `12h10m` and `168h` | Sets withdrawal availability and the oldest accepted payment-promise creation time |
+| `payment_promise_timeout` | `1h` | Must be between `10m` and `12h` | Defines normal promise expiration and when timeout processing becomes valid |
+| `payment_promise_height_window` | `1000` | Must be nonzero | Limits how far behind the current height a normal payment promise can be |
+| `shard_retention` | `4h` | Must be between `10m` and `168h` | Sets the local retention floor validators apply to uploaded shards |
+| `full_stake_storage_budget` | `2TiB` | Must be positive | Caps the Fibre disk a 100%-stake validator uses over one `shard_retention` window; each node derives its own budget from its assigned stake share |
+
+The processed-payment retention window is not a governance parameter; it is derived as `withdrawal_delay + 10m` and exposed by `Params.PaymentPromiseRetentionWindow()` (see the last paragraph for why).
+
+`payment_promise_timeout` is bounded below so a promise stays valid long enough to be uploaded, signed, and settled in a block, and bounded above so it stays well inside the `withdrawal_delay` window gating its `creation_timestamp`.
+
+`shard_retention` is bounded below so shards outlive the window in which a client fetches them back, and above to cap the local storage obligation it places on assigned validators.
+
+`withdrawal_delay` is bounded below by the maximum `payment_promise_timeout` plus `10m`, and bounded above to cap how long escrowed funds stay locked after a withdrawal request and to keep the derived retention window `withdrawal_delay + 10m` far from overflowing the duration type.
+
+The lower bound has to clear the maximum `payment_promise_timeout` so a promise never goes stale before its own normal-path expiry. The extra `10m` keeps the timeout settlement path usable. `MsgPaymentPromiseTimeout` is accepted only from `creation_timestamp + payment_promise_timeout` until the promise stops being settleable at `creation_timestamp + withdrawal_delay`; if the two could meet, that window would be empty and an expired promise could never be claimed. Because the floor already covers the widest allowed timeout plus the margin, every valid combination of the two parameters leaves at least `10m` to submit the message, so no cross-parameter check is needed.
+
+A promise can be timestamped up to 10 minutes ahead of the block that settles it, so it may remain settleable that much longer than `withdrawal_delay`. Deriving the retention window as `withdrawal_delay + 10m` guarantees the processed-payment record always outlives the promise's settleable span, so a settled promise can never be replayed after its record is pruned. No separate parameter or cross-field validation is needed.
+
+## CLI
+
+The transaction CLI exposes:
+
+```text
+celestia-appd tx fibre deposit-to-escrow [amount]
+celestia-appd tx fibre request-withdrawal [amount]
+celestia-appd tx fibre pay-for-fibre [payment-promise-json] [validator-signatures]
+celestia-appd tx fibre payment-promise-timeout [payment-promise-json]
+```
+
+`pay-for-fibre` expects `payment-promise-json` to be a JSON representation of `PaymentPromise` and `validator-signatures` to be a comma-separated list of hex-encoded validator signatures.
+
+The query CLI exposes:
+
+```text
+celestia-appd query fibre params
+celestia-appd query fibre escrow-account [signer]
+celestia-appd query fibre withdrawals [signer]
+celestia-appd query fibre is-payment-processed [payment-promise-hash]
+```
+
+There is currently no CLI command wrapping the `ValidatePaymentPromise` gRPC query.

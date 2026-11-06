@@ -1,0 +1,246 @@
+package fibre
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+
+	fibregrpc "github.com/celestiaorg/celestia-app/v11/fibre/internal/grpc"
+	"github.com/celestiaorg/celestia-app/v11/fibre/state"
+	"github.com/celestiaorg/celestia-app/v11/fibre/validator"
+	"github.com/celestiaorg/celestia-app/v11/pkg/user"
+	"github.com/cosmos/cosmos-sdk/crypto/keyring"
+	clock "github.com/filecoin-project/go-clock"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// DefaultKeyName is the default key name for the client.
+// Exposed for testing purposes.
+const DefaultKeyName = "default-fibre"
+
+var (
+	// ErrClientClosed is returned when an operation is attempted on a closed client.
+	ErrClientClosed = errors.New("fibre: client is closed")
+	// errClientNotStarted is returned when Upload or Put is called before Start.
+	errClientNotStarted = errors.New("fibre: client is not started")
+	// ErrNoKeyring is returned when Upload or Put is called without a keyring.
+	ErrNoKeyring = errors.New("fibre: keyring is required for uploads")
+	// ErrKeyNotFound is returned when the configured key is not found in the keyring.
+	ErrKeyNotFound = errors.New("fibre: key not found in keyring")
+)
+
+// Client is the Fibre DA client.
+type Client struct {
+	Config ClientConfig
+
+	keyring keyring.Keyring
+	state   state.Client
+
+	log     *slog.Logger
+	tracer  trace.Tracer
+	metrics *clientMetrics
+	clock   clock.Clock
+
+	clientCache *fibregrpc.ClientCache
+	// warmedSet is the hash of the last validator set pre-dialed by warm.
+	warmMu    sync.Mutex
+	warmedSet string
+
+	// escrowLedgers holds one client-side escrow accountant per signer address,
+	// created lazily on first use. It guards local admission and auto-funding
+	// so uploads don't fail on an underfunded escrow. See [escrowLedger].
+	escrowMu      sync.Mutex
+	escrowLedgers map[string]*escrowLedger
+
+	// closeWg tracks subroutines spawned by Upload/Download operations.
+	// Close() waits for this WaitGroup to ensure all operations complete before releasing resources.
+	// Upload/Download operations don't wait for their spawned goroutines, allowing them to return early for low latency.
+	closeWg sync.WaitGroup
+	// started indicates whether Start() has been called.
+	started atomic.Bool
+	// closed indicates whether Stop has been called.
+	closed atomic.Bool
+	// stopCh is closed by Stop to release background upload goroutines that are
+	// waiting out a retry delay.
+	stopCh chan struct{}
+}
+
+// NewClient creates a new [Client]; a nil keyring allows downloads only.
+// If a keyring is provided, the configured key must exist.
+func NewClient(kr keyring.Keyring, cfg ClientConfig) (*Client, error) {
+	if kr != nil {
+		if _, err := kr.Key(cfg.DefaultKeyName); err != nil {
+			return nil, fmt.Errorf("%w: %s: %v", ErrKeyNotFound, cfg.DefaultKeyName, err)
+		}
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
+	stateClient, err := cfg.StateClientFn()
+	if err != nil {
+		return nil, fmt.Errorf("create state client: %w", err)
+	}
+
+	// The default dialer is bound to this client's state client, so it stays
+	// out of the exported Config: a client built from a copied Config must
+	// dial through its own state client.
+	newClientFn := cfg.NewClientFn
+	if newClientFn == nil {
+		newClientFn = fibregrpc.DefaultNewClientFn(stateClient, stateClient.ChainID, cfg.MaxMessageSize, cfg.Log)
+	}
+
+	metrics, err := newClientMetrics(cfg.Meter)
+	if err != nil {
+		return nil, fmt.Errorf("creating metrics: %w", err)
+	}
+
+	return &Client{
+		Config:        cfg,
+		keyring:       kr,
+		state:         stateClient,
+		log:           cfg.Log,
+		tracer:        cfg.Tracer,
+		metrics:       metrics,
+		clock:         cfg.Clock,
+		clientCache:   fibregrpc.NewClientCache(newClientFn, DefaultProtocolParams.MaxValidatorCount, fibregrpc.WithTracer(cfg.Tracer)),
+		escrowLedgers: make(map[string]*escrowLedger),
+		stopCh:        make(chan struct{}),
+	}, nil
+}
+
+// escrowLedgerFor returns the escrow ledger for the account behind txClient,
+// creating it (and its deposit/query adapters) on first use. The signer is the
+// tx client's default address — the escrow owner that signs PaymentPromises.
+func (c *Client) escrowLedgerFor(txClient *user.TxClient) *escrowLedger {
+	signer := txClient.DefaultAddress().String()
+	c.escrowMu.Lock()
+	defer c.escrowMu.Unlock()
+	if l, ok := c.escrowLedgers[signer]; ok {
+		return l
+	}
+	l := newEscrowLedger(signer, c.Config.Escrow, c.clock,
+		newTxEscrowQuerier(txClient), txDepositor{tx: txClient}, c.log)
+	c.escrowLedgers[signer] = l
+	return l
+}
+
+// refillAsync tops up the ledger's escrow off the Put hot path as a best-effort
+// proactive top-up. The deposit is single-flighted inside [escrowLedger.refill],
+// so calling this on every low-budget admit never stacks concurrent deposits. It
+// is not tracked by closeWg: the only side effect is a MsgDepositToEscrow into
+// the client's own escrow, so a deposit still in flight when Stop closes the
+// connection simply fails and is retried on the next low admit — nothing to wait
+// for. The closed check just avoids spawning obviously-doomed work.
+func (c *Client) refillAsync(ledger *escrowLedger) {
+	if c.closed.Load() {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*c.Config.RPCTimeout)
+		defer cancel()
+		ledger.refill(ctx)
+	}()
+}
+
+// ChainID returns the chain ID resolved during [Start].
+func (c *Client) ChainID() string {
+	return c.state.ChainID()
+}
+
+// validatorSet fetches the validator set bounded by [ClientConfig.RPCTimeout]
+// so a hung app node cannot stall an Upload/Download before any shard is
+// exchanged. A height of 0 returns the head set; a non-zero height returns the
+// set at that height.
+func (c *Client) validatorSet(ctx context.Context, height uint64) (validator.Set, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.Config.RPCTimeout)
+	defer cancel()
+	if height > 0 {
+		return c.state.GetByHeight(ctx, height)
+	}
+	return c.state.Head(ctx)
+}
+
+// Await waits for all ongoing [Client.Upload]/[Client.Download] operations to complete.
+// Await is idempotent and safe to call multiple times.
+func (c *Client) Await() {
+	c.closeWg.Wait()
+}
+
+// Start initializes the client by starting the underlying [StateClient]
+// (e.g. auto-detecting the chain ID from the node).
+// Must be called before [Client.Upload] or [Client.Download].
+func (c *Client) Start(ctx context.Context) error {
+	if !c.started.CompareAndSwap(false, true) {
+		return nil
+	}
+	if err := c.state.Start(ctx); err != nil {
+		c.started.Store(false)
+		return err
+	}
+	c.log.Info("client ready", "chain_id", c.state.ChainID())
+	if valSet, err := c.validatorSet(ctx, 0); err == nil {
+		c.warm(valSet)
+	} else {
+		c.log.Warn("not pre-dialing validators", "error", err)
+	}
+	return nil
+}
+
+// warm pre-dials the validators of valSet in the background once per distinct
+// set, so uploads and downloads start on established connections.
+func (c *Client) warm(valSet validator.Set) {
+	if valSet.ValidatorSet == nil {
+		return
+	}
+	hash := string(valSet.Hash())
+	c.warmMu.Lock()
+	if hash == c.warmedSet {
+		c.warmMu.Unlock()
+		return
+	}
+	c.warmedSet = hash
+	c.warmMu.Unlock()
+
+	c.closeWg.Go(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), c.Config.RPCTimeout)
+		defer cancel()
+		go func() {
+			select {
+			case <-c.stopCh:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+		c.clientCache.Warm(ctx, valSet.Validators)
+	})
+}
+
+// Stop stops the client and releases any associated resources.
+// It waits for all ongoing [Client.Upload]/[Client.Download] operations to complete before stopping.
+// After Stop is called, subsequent [Client.Upload]/[Client.Download] calls will return an error.
+// Stop is idempotent and safe to call multiple times.
+// Cancelling the context forces an immediate stop without waiting for in-flight operations.
+func (c *Client) Stop(ctx context.Context) error {
+	if !c.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	close(c.stopCh)
+
+	c.log.Info("stopping client")
+	done := make(chan struct{})
+	go func() {
+		c.closeWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+	return errors.Join(c.clientCache.Close(), c.state.Stop(ctx))
+}

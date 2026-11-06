@@ -1,0 +1,352 @@
+package fibre
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"math/bits"
+
+	fibregrpc "github.com/celestiaorg/celestia-app/v11/fibre/internal/grpc"
+	"github.com/celestiaorg/celestia-app/v11/fibre/internal/tlsid"
+	"github.com/celestiaorg/celestia-app/v11/fibre/state"
+	"github.com/celestiaorg/celestia-app/v11/pkg/rsema1d"
+	core "github.com/cometbft/cometbft/types"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+	grpclib "google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+)
+
+// Server implements the Fibre gRPC service for validators.
+// It handles upload and download requests from clients.
+type Server struct {
+	Config ServerConfig
+
+	state  state.Client
+	store  *Store
+	grpc   *fibregrpc.Server
+	signer core.PrivValidator
+
+	log     *slog.Logger
+	tracer  trace.Tracer
+	metrics *serverMetrics
+
+	verifiers chan *rsema1d.Verifier // caps concurrent verifications
+
+	occ     *occupancy
+	uploads uploadCoordinator
+
+	health     *healthManager
+	healthDone chan struct{}
+
+	pruneDone chan struct{}
+	cancel    context.CancelFunc
+}
+
+// NewServer creates a new Fibre [Server]. The store backend is determined by
+// [ServerConfig.StoreFn], which defaults to [NewStore].
+func NewServer(cfg ServerConfig) (*Server, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+
+	stateClient, err := cfg.StateClientFn()
+	if err != nil {
+		return nil, err
+	}
+
+	occ := newOccupancy(0)
+
+	metrics, err := newServerMetrics(cfg.Meter, occ)
+	if err != nil {
+		return nil, fmt.Errorf("creating metrics: %w", err)
+	}
+
+	server := &Server{
+		Config:    cfg,
+		state:     stateClient,
+		log:       cfg.Log,
+		tracer:    cfg.Tracer,
+		metrics:   metrics,
+		verifiers: newVerifierPool(cfg.UploadVerifyWorkers),
+		occ:       occ,
+		health:    newHealthManager(cfg.health, cfg.Log),
+	}
+
+	if cfg.MaxConnections != 0 {
+		cfg.Log.Warn("max_connections is deprecated and ignored; connections are capped per IP by max_connections_per_ip", "max_connections", cfg.MaxConnections)
+	}
+	server.grpc, err = fibregrpc.Listen(cfg.ServerListenAddress, cfg.MaxConnectionsPerIP, cfg.MaxConcurrentStreams, fibregrpc.AdmissionConfig{
+		Budget:     cfg.MaxRequestMemory,
+		MaxMessage: int64(cfg.MaxMessageSize),
+		OnReject: func(ctx context.Context, method, reason string) {
+			metrics.requestRejected.Add(ctx, 1, metric.WithAttributes(attribute.String("method", method), attribute.String("reason", reason)))
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("opening gRPC listener: %w", err)
+	}
+	if err := registerGRPCMetrics(cfg.Meter, server.grpc); err != nil {
+		server.grpc.Stop(context.Background()) // closes the listener
+		return nil, fmt.Errorf("creating metrics: %w", err)
+	}
+
+	return server, nil
+}
+
+// Done is closed once the gRPC server stopped serving, through Stop or because
+// it failed. Err tells the two apart.
+func (s *Server) Done() <-chan struct{} { return s.grpc.Done() }
+
+// Err returns the error the gRPC server exited with, or nil.
+func (s *Server) Err() error { return s.grpc.Err() }
+
+// ListenAddress returns the actual address the server is listening on.
+func (s *Server) ListenAddress() string {
+	return s.grpc.ListenAddress()
+}
+
+// ChainID returns the chain ID detected from the connected app node.
+func (s *Server) ChainID() string {
+	return s.state.ChainID()
+}
+
+// Store returns the server's store.
+func (s *Server) Store() *Store {
+	return s.store
+}
+
+// Start connects to the celestia-app node, creates the signer,
+// starts serving gRPC requests, and kicks off background pruning and health checks.
+// NOTE: Order of operations is important. Start the state client first,
+// then create the signer, and finally start the pruning loop followed by the gRPC server.
+func (s *Server) Start(ctx context.Context) (err error) {
+	if err := s.state.Start(ctx); err != nil {
+		return err
+	}
+	chainID := s.state.ChainID()
+
+	s.signer, err = s.Config.newSigner(chainID)
+	if err != nil {
+		return fmt.Errorf("creating signer: %w", err)
+	}
+	s.log.Info("signer ready")
+
+	cert, err := tlsid.BuildServerCert(s.signer, chainID)
+	if err != nil {
+		return fmt.Errorf("building TLS cert: %w", err)
+	}
+	creds := credentials.NewTLS(&tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+	})
+	s.grpc.RegisterWithUploadBufferReuse(s,
+		s.Config.MaxMessageSize,
+		DefaultProtocolParams.MaxRowsPerValidator(),
+		DefaultProtocolParams.MerkleProofDepth(),
+		grpclib.MaxSendMsgSize(s.Config.MaxMessageSize),
+		grpclib.Creds(creds),
+	)
+	s.health.registerGRPC(s.grpc)
+
+	pubKey, err := s.signer.GetPubKey()
+	if err != nil {
+		return fmt.Errorf("getting validator public key: %w", err)
+	}
+	s.Config.ObjectStorage.ChainID = chainID
+	s.Config.ObjectStorage.ValidatorAddress = sdk.ConsAddress(pubKey.Address()).String()
+	objectCfg, objectConfigured := s.Config.ObjectStorage.validated()
+	if !objectConfigured {
+		partial := s.Config.ObjectStorage
+		if partial.Endpoint != "" || partial.Bucket != "" || partial.Prefix != "" {
+			s.log.Warn("object storage configuration is invalid", "error", partial.Validate())
+		}
+	}
+	if err := registerStoreBackendMetric(s.Config.Meter, s.Config.StorageBackend, objectConfigured); err != nil {
+		return fmt.Errorf("creating metrics: %w", err)
+	}
+	s.store, err = s.Config.StoreFn(ctx, s.Config.StoreConfig)
+	if err != nil {
+		return fmt.Errorf("opening store: %w", err)
+	}
+	storeLogArgs := []any{
+		"storage_backend", s.Config.StorageBackend,
+		"object_configured", objectConfigured,
+		"object_markers_present", s.store.shards.objectMarkersPresent,
+	}
+	if objectConfigured {
+		objectNamespace := objectCfg.canonical()
+		storeLogArgs = append(storeLogArgs, slog.Group("object_namespace",
+			slog.String("endpoint_host", objectCfg.endpointHost()),
+			slog.String("bucket", objectNamespace.Bucket),
+			slog.String("prefix", objectNamespace.Prefix),
+			slog.String("chain_id", objectNamespace.ChainID),
+			slog.String("validator_address", objectNamespace.ValidatorAddress),
+		))
+	}
+	s.log.Info("store ready", storeLogArgs...)
+	s.store.shards.setMetrics(s.metrics)
+
+	if err := s.seedOccupancy(ctx); err != nil {
+		return err
+	}
+
+	// Derive the budget once at startup.
+	if err := s.recomputeBudget(ctx); err != nil {
+		return fmt.Errorf("deriving initial storage budget: %w", err)
+	}
+	if !s.Config.UnlimitedBudget && s.occ.budgetBytes() <= 0 {
+		s.log.Warn("derived storage budget is 0 (validator not in the active set?); " +
+			"running without a storage limit until it is re-derived")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+
+	s.pruneDone = make(chan struct{})
+	go func() {
+		defer close(s.pruneDone)
+		s.startPruneLoop(ctx)
+	}()
+
+	s.grpc.Serve()
+	s.log.Info("serving gRPC", "addr", s.grpc.ListenAddress())
+
+	s.health.start(healthDeps{client: s.state, signer: s.signer, pubKey: pubKey, store: s.store}, chainID)
+	s.healthDone = make(chan struct{})
+	go func() {
+		defer close(s.healthDone)
+		s.health.run(ctx)
+	}()
+	return nil
+}
+
+func (s *Server) seedOccupancy(ctx context.Context) error {
+	size, err := s.store.Size(ctx)
+	if err != nil && !errors.Is(err, ErrStoreIntegrity) {
+		return fmt.Errorf("getting store size: %w", err)
+	}
+	if err != nil {
+		s.log.Warn("store size may be incorrect due to corrupt shard marker", "error", err)
+	}
+	s.occ.seed(size)
+	return nil
+}
+
+// Stop gracefully stops the gRPC server and background routines,
+// then closes the underlying store and app connection.
+// Cancelling the context forces an immediate stop without waiting for in-flight requests.
+func (s *Server) Stop(ctx context.Context) (err error) {
+	s.log.Info("stopping server")
+	s.health.stop() // publish not ready before draining
+	if s.cancel != nil {
+		s.cancel()
+	}
+	s.grpc.Stop(ctx)
+	if s.pruneDone != nil {
+		<-s.pruneDone
+	}
+	if s.healthDone != nil {
+		<-s.healthDone
+	}
+
+	if closer, ok := s.signer.(io.Closer); ok {
+		if closeErr := closer.Close(); closeErr != nil {
+			s.log.Error("closing signer", "error", closeErr)
+			err = errors.Join(err, closeErr)
+		}
+	}
+	if s.store != nil {
+		if closeErr := s.store.Close(); closeErr != nil {
+			s.log.Error("closing store", "error", closeErr)
+			err = errors.Join(err, closeErr)
+		}
+	}
+	if s.state != nil {
+		if closeErr := s.state.Stop(ctx); closeErr != nil {
+			s.log.Error("closing state client", "error", closeErr)
+			err = errors.Join(err, closeErr)
+		}
+	}
+	return err
+}
+
+// recomputeBudget derives this node's occupancy budget from the governance
+// parameter and its current stake (FullStakeStorageBudget * assignedRows /
+// OriginalRows) and applies it to the counter. It applies an unlimited (zero)
+// budget when the limiter is disabled — via UnlimitedBudget or a non-positive
+// governance parameter — and returns an error when the parameter, validator
+// set, or signer cannot be read.
+func (s *Server) recomputeBudget(ctx context.Context) error {
+	if s.Config.UnlimitedBudget {
+		s.occ.setBudget(0)
+		return nil
+	}
+
+	fullStake, err := s.state.FullStakeStorageBudget(ctx)
+	if err != nil {
+		return fmt.Errorf("querying full-stake storage budget: %w", err)
+	}
+
+	// FullStakeStorageBudget must be positive when the limiter is enabled. Treat a
+	// non-positive value as an error so we keep the previous budget (or fail
+	// startup) rather than silently running unlimited.
+	if fullStake <= 0 {
+		return fmt.Errorf("full-stake storage budget must be positive (got %d); pass --unlimited-budget to disable the limiter", fullStake)
+	}
+
+	valSet, err := s.state.Head(ctx)
+	if err != nil {
+		return fmt.Errorf("fetching head validator set: %w", err)
+	}
+
+	key, err := s.signer.GetPubKey()
+	if err != nil {
+		return fmt.Errorf("getting validator public key: %w", err)
+	}
+
+	ourVal, found := valSet.GetByAddress(key.Address())
+	if !found {
+		// Not in the active set: no new assignments. Keep whatever budget is
+		// already applied. During a periodic recompute that preserves the last
+		// derived budget, so promises from heights we were assigned to are still
+		// bounded; at startup nothing has been derived yet, so the budget stays 0
+		// and Start refuses to boot a node that cannot derive its budget.
+		return nil
+	}
+
+	assignedRows := valSet.AssignedRows(ourVal, s.Config.OriginalRows, s.Config.MinRowsPerValidator, s.Config.LivenessThreshold)
+	budget := deriveBudget(fullStake, assignedRows, s.Config.OriginalRows)
+
+	if fullStake < int64(s.Config.MaxShardSize) {
+		s.log.WarnContext(ctx, "FullStakeStorageBudget is below one maximum shard; uploads near the maximum blob size will be rejected",
+			"full_stake_budget", fullStake, "max_shard_size", s.Config.MaxShardSize)
+	}
+	if budget > 0 {
+		if avail, err := s.store.DiskAvailable(); err == nil && avail < budget {
+			s.log.WarnContext(ctx, "available disk is below the storage budget; provision more or the disk will fill",
+				"available_bytes", avail, "budget_bytes", budget)
+		}
+	}
+
+	s.occ.setBudget(budget)
+	return nil
+}
+
+// deriveBudget returns fullStake * assignedRows / originalRows in bytes. The
+// product can exceed int64 for a large fullStake, so it is computed in 128 bits;
+// with assignedRows <= originalRows the result stays within [0, fullStake].
+// Non-positive inputs yield 0, which disables the limiter.
+func deriveBudget(fullStake int64, assignedRows, originalRows int) int64 {
+	if fullStake <= 0 || assignedRows <= 0 || originalRows <= 0 {
+		return 0
+	}
+	hi, lo := bits.Mul64(uint64(fullStake), uint64(assignedRows))
+	quo, _ := bits.Div64(hi, lo, uint64(originalRows))
+	return int64(quo)
+}

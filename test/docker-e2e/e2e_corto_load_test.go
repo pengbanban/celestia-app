@@ -1,0 +1,311 @@
+package docker_e2e
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"net/http"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"celestiaorg/celestia-app/test/docker-e2e/networks"
+	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
+	jsonrpcclient "github.com/cometbft/cometbft/rpc/jsonrpc/client"
+	"github.com/stretchr/testify/require"
+)
+
+const (
+	// Default load: 5 MiB blobs every 250 ms (sequential, no workers).
+	defaultCortoBlobSize        = 5 * 1024 * 1024        // 5 MiB per blob
+	defaultCortoSubmissionDelay = 250 * time.Millisecond // 4 blobs/s × 5 MiB
+	defaultCortoTestDuration    = 10 * time.Minute
+
+	// Parallel worker accounts. 1 = sequential submission (broadcast only, no
+	// per-tx confirmation wait on the critical path). Values >1 enable parallel
+	// workers, but each worker then blocks until its tx is committed, so the
+	// submission ceiling becomes workers / confirmation_time. Worker accounts
+	// are auto-created, funded, and fee-granted from the master account.
+	defaultCortoWorkers = 1
+
+	// Assertions: both the average and the 99th-percentile inter-block interval
+	// must stay ≤ 4 s while the network processes 20 MiB of blobs per second.
+	maxAvgBlockTime = 4 * time.Second
+	maxP99BlockTime = 4 * time.Second
+
+	// Bound on the average effective latency, which excludes the client-side
+	// broadcast (signing and uploading the blob). Nightly runs against Corto
+	// sit between 5.0 s and 5.6 s, so this leaves headroom for a busier network
+	// while still catching a regression.
+	maxAvgEffectiveLatency = 8 * time.Second
+	// minSuccessRate tolerates a small number of transient submission failures
+	// while still catching real regressions, which drop the success rate well
+	// below this bound.
+	minSuccessRate = 0.99 // 99%
+)
+
+// TestCortoLoad connects to the Corto internal testnet, submits blobs via the
+// latency-monitor at a configurable rate, and checks whether block times
+// degrade under load.
+//
+// Required env vars:
+//
+//	CORTO_PRIV_KEY – hex-encoded private key for a funded Corto account
+//	CORTO_RPC      – RPC endpoint
+//	CORTO_GRPC     – gRPC endpoint
+//
+// Optional env vars (with defaults):
+//
+//	CORTO_AUTH_TOKEN       – auth token sent as an x-token header on gRPC calls
+//	                         and as an Authorization Bearer header on RPC requests
+//	CORTO_KEYRING_DIR      – keyring directory (alternative to CORTO_PRIV_KEY)
+//	CORTO_BLOB_SIZE        – blob size in bytes (default: 5 MiB)
+//	CORTO_SUBMISSION_DELAY – delay between blobs (default: 250ms)
+//	CORTO_TEST_DURATION    – total duration      (default: 10m)
+//	CORTO_WORKERS          – parallel worker accounts (default: 1 = sequential)
+func (s *CelestiaTestSuite) TestCortoLoad() {
+	t := s.T()
+	if testing.Short() {
+		t.Skip("skipping Corto load test in short mode")
+	}
+
+	privKeyHex := os.Getenv("CORTO_PRIV_KEY")
+	keyringDir := os.Getenv("CORTO_KEYRING_DIR")
+	if privKeyHex == "" && keyringDir == "" {
+		t.Skip("CORTO_PRIV_KEY or CORTO_KEYRING_DIR not set, skipping Corto load test")
+	}
+	if os.Getenv("CORTO_RPC") == "" || os.Getenv("CORTO_GRPC") == "" {
+		t.Skip("CORTO_RPC or CORTO_GRPC not set, skipping Corto load test")
+	}
+
+	// Parse configurable parameters.
+	blobSize := envIntOr("CORTO_BLOB_SIZE", defaultCortoBlobSize)
+	submissionDelay := envDurationOr("CORTO_SUBMISSION_DELAY", defaultCortoSubmissionDelay)
+	testDuration := envDurationOr("CORTO_TEST_DURATION", defaultCortoTestDuration)
+	workers := envIntOr("CORTO_WORKERS", defaultCortoWorkers)
+
+	cortoCfg, err := networks.NewCortoConfig()
+	require.NoError(t, err, "failed to build Corto config")
+
+	// A configured token implies a TLS-terminating auth proxy, whatever the
+	// port. Unauthenticated endpoints on port 443 (e.g.
+	// grpc.celestia-corto.com:443) are also dialed with TLS.
+	useTLS := cortoCfg.AuthToken != "" || strings.HasSuffix(cortoCfg.GRPCs[0], ":443")
+
+	t.Logf("Corto Load Test Configuration:")
+	t.Logf("  RPC:              %s (auth=%v)", cortoCfg.RPCs[0], cortoCfg.AuthToken != "")
+	t.Logf("  gRPC:             %s (tls=%v, auth=%v)", cortoCfg.GRPCs[0], useTLS, cortoCfg.AuthToken != "")
+	t.Logf("  Blob size:        %d bytes", blobSize)
+	t.Logf("  Submission delay: %v", submissionDelay)
+	t.Logf("  Workers:          %d", workers)
+	t.Logf("  Test duration:    %v", testDuration)
+	t.Logf("  Per-block data:   ~%.1f MiB (assuming 3 s blocks)",
+		float64(blobSize)*3/submissionDelay.Seconds()/1024/1024)
+
+	ctx := context.Background()
+
+	// --- 1. Connect to Corto RPC for block time monitoring ---
+	rpcClient, err := newAuthedRPCClient(cortoCfg.RPCs[0], cortoCfg.AuthToken)
+	require.NoError(t, err, "failed to create RPC client")
+
+	// Corto is an internal testnet: when the test is configured to run against
+	// it, an unreachable endpoint is a real failure, not a reason to skip.
+	status, err := rpcClient.Status(ctx)
+	require.NoError(t, err, "Corto endpoint %s unavailable", cortoCfg.RPCs[0])
+	startHeight := status.SyncInfo.LatestBlockHeight
+	t.Logf("Connected to Corto at height %d", startHeight)
+
+	// --- 2. Deploy latency-monitor against Corto ---
+	container, err := s.DeployLatencyMonitorForNetwork(ctx, cortoCfg.GRPCs[0], LatencyMonitorConfig{
+		BlobSize:        blobSize,
+		MinBlobSize:     blobSize,
+		SubmissionDelay: submissionDelay,
+		Workers:         workers,
+		PrivKeyHex:      privKeyHex,
+		KeyringDir:      keyringDir,
+		TLS:             useTLS,
+		AuthToken:       cortoCfg.AuthToken,
+	})
+	require.NoError(t, err, "failed to deploy latency-monitor")
+
+	// --- 4. Run for the test duration ---
+	t.Logf("Running load test for %v...", testDuration)
+	time.Sleep(testDuration)
+
+	// --- 5. Collect latency results ---
+	t.Log("Collecting latency results...")
+	latencyResults, err := s.CollectLatencyResults(ctx, t, container.Name)
+	if err != nil {
+		// A chain that stopped producing blocks leaves every tx unconfirmed.
+		if st, statusErr := rpcClient.Status(ctx); statusErr == nil {
+			t.Logf("Corto height went from %d to %d during the load test", startHeight, st.SyncInfo.LatestBlockHeight)
+		} else {
+			t.Logf("Corto status failed after the load test: %v", statusErr)
+		}
+	}
+	require.NoError(t, err, "failed to collect latency results")
+
+	// --- 6. Collect block time data ---
+	endStatus, err := rpcClient.Status(ctx)
+	require.NoError(t, err, "failed to get end height")
+	endHeight := endStatus.SyncInfo.LatestBlockHeight
+	t.Logf("Load test covered heights %d to %d (%d blocks)", startHeight, endHeight, endHeight-startHeight)
+
+	blockTimes, err := fetchBlockTimes(ctx, rpcClient, startHeight, endHeight)
+	require.NoError(t, err, "failed to fetch block times")
+	require.NotEmpty(t, blockTimes, "no block time samples collected")
+
+	avgBT, err := averageBlockTime(blockTimes, startHeight, endHeight)
+	require.NoError(t, err, "failed to compute average block time")
+
+	p99BT := p99BlockTime(blockTimes, startHeight, endHeight)
+
+	// --- 7. Report ---
+	t.Logf("")
+	t.Logf("=== Corto Load Test Results ===")
+	t.Logf("")
+	t.Logf("Block Time Statistics (%d blocks):", len(blockTimes))
+	t.Logf("  Average: %v", avgBT)
+	t.Logf("  p99:     %v", p99BT)
+	t.Logf("")
+	t.Logf("Tx Submission Statistics:")
+	t.Logf("  Total Transactions: %d", latencyResults.TotalTxs)
+	t.Logf("  Successful: %d (%.2f%%)", latencyResults.SuccessCount, latencyResults.SuccessRate*100)
+	t.Logf("  Failed: %d", latencyResults.FailureCount)
+	t.Logf("  Avg Latency: %v", latencyResults.AvgLatency)
+	t.Logf("  Max Latency: %v", latencyResults.MaxLatency)
+	t.Logf("  Avg Effective Latency (excl. broadcast): %v", latencyResults.AvgEffectiveLatency)
+	t.Logf("  Max Effective Latency (excl. broadcast): %v", latencyResults.MaxEffectiveLatency)
+
+	// --- 8. Assert: block time must not exceed 4 s under 20 MiB/s load ---
+	require.LessOrEqual(t, avgBT, maxAvgBlockTime,
+		"average block time %v exceeds %v under 20 MiB/s blob load", avgBT, maxAvgBlockTime)
+	require.LessOrEqual(t, p99BT, maxP99BlockTime,
+		"p99 block time %v exceeds %v under 20 MiB/s blob load", p99BT, maxP99BlockTime)
+
+	// --- 9. Assert: blob submission must stay reliable and fast under load ---
+	require.GreaterOrEqual(t, latencyResults.SuccessRate, minSuccessRate,
+		"success rate %.2f%% below threshold %.2f%%",
+		latencyResults.SuccessRate*100, minSuccessRate*100)
+
+	// Effective latency is only recorded in sequential mode; with parallel
+	// workers broadcast completion is not observable and the average is zero.
+	if workers <= 1 {
+		require.LessOrEqual(t, latencyResults.AvgEffectiveLatency, maxAvgEffectiveLatency,
+			"avg effective latency %v exceeds threshold %v",
+			latencyResults.AvgEffectiveLatency, maxAvgEffectiveLatency)
+	}
+
+	t.Log("Corto load test passed")
+}
+
+// newAuthedRPCClient returns an RPC client for the given endpoint that
+// attaches the token as an Authorization Bearer header when set.
+func newAuthedRPCClient(remote, token string) (*rpchttp.HTTP, error) {
+	if token != "" && !strings.HasPrefix(remote, "https://") {
+		return nil, fmt.Errorf("an auth token is set but RPC endpoint %s is not https: refusing to send the token over plaintext", remote)
+	}
+	httpClient, err := jsonrpcclient.DefaultHTTPClient(remote)
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		httpClient.Transport = &bearerRoundTripper{token: token, base: httpClient.Transport}
+	}
+	return rpchttp.NewWithClient(remote, "/websocket", httpClient)
+}
+
+// bearerRoundTripper attaches an Authorization Bearer header to every request.
+type bearerRoundTripper struct {
+	token string
+	base  http.RoundTripper
+}
+
+func (b *bearerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	clone.Header.Set("Authorization", "Bearer "+b.token)
+	return b.base.RoundTrip(clone)
+}
+
+// fetchBlockTimes retrieves block timestamps between startHeight and endHeight
+// (inclusive) and returns them indexed by height.
+func fetchBlockTimes(ctx context.Context, rpcClient *rpchttp.HTTP, startHeight, endHeight int64) (map[int64]time.Time, error) {
+	if endHeight <= startHeight {
+		return nil, fmt.Errorf("endHeight %d <= startHeight %d", endHeight, startHeight)
+	}
+
+	// BlockchainInfo accepts inclusive [min, max] ranges of up to 20 blocks per call.
+	const batchSize = 20
+	times := make(map[int64]time.Time, endHeight-startHeight+1)
+	for batchStart := startHeight; batchStart <= endHeight; {
+		// Last height in this batch (inclusive), capped so we never query past endHeight.
+		batchEnd := min(batchStart+batchSize-1, endHeight)
+		info, err := rpcClient.BlockchainInfo(ctx, batchStart, batchEnd)
+		if err != nil {
+			return nil, fmt.Errorf("BlockchainInfo(%d, %d): %w", batchStart, batchEnd, err)
+		}
+		for _, bm := range info.BlockMetas {
+			times[bm.Header.Height] = bm.Header.Time
+		}
+		batchStart = batchEnd + 1 // next window starts right after this one
+	}
+
+	return times, nil
+}
+
+// averageBlockTime returns the mean inter-block duration across the given heights.
+// Uses telescoping: (last - first) / (number of intervals).
+func averageBlockTime(times map[int64]time.Time, startHeight, endHeight int64) (time.Duration, error) {
+	first, ok := times[startHeight]
+	if !ok {
+		return 0, fmt.Errorf("missing block time for start height %d", startHeight)
+	}
+	last, ok := times[endHeight]
+	if !ok {
+		return 0, fmt.Errorf("missing block time for end height %d", endHeight)
+	}
+	return last.Sub(first) / time.Duration(endHeight-startHeight), nil
+}
+
+// p99BlockTime returns the 99th-percentile (nearest-rank) interval between
+// two consecutive blocks in [startHeight, endHeight].
+func p99BlockTime(times map[int64]time.Time, startHeight, endHeight int64) time.Duration {
+	intervals := make([]time.Duration, 0, endHeight-startHeight)
+	for h := startHeight + 1; h <= endHeight; h++ {
+		cur, curOK := times[h]
+		prev, prevOK := times[h-1]
+		if !curOK || !prevOK {
+			continue
+		}
+		intervals = append(intervals, cur.Sub(prev))
+	}
+	if len(intervals) == 0 {
+		return 0
+	}
+	slices.Sort(intervals)
+	rank := int(math.Ceil(0.99 * float64(len(intervals))))
+	return intervals[rank-1]
+}
+
+// envIntOr reads an integer from an environment variable or returns a default.
+func envIntOr(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return fallback
+}
+
+// envDurationOr reads a duration from an environment variable or returns a default.
+func envDurationOr(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return fallback
+}

@@ -1,0 +1,194 @@
+package types
+
+import (
+	errorsmod "cosmossdk.io/errors"
+	"github.com/celestiaorg/celestia-app/v11/pkg/appconsts"
+	"github.com/celestiaorg/go-square/v4/share"
+	"github.com/cometbft/cometbft/crypto/ed25519"
+	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
+)
+
+const (
+	BlobVersionZero = uint32(0)
+
+	// MaxChainIDSize is the longest chain ID a payment promise can carry, and
+	// PromiseSignatureSize the size of its secp256k1 signature in compact
+	// format. Both are what the promise sign-bytes layout allows.
+	MaxChainIDSize       = 20
+	PromiseSignatureSize = 64
+)
+
+// ValidateBasic performs stateless validation for MsgDepositToEscrow
+func (msg *MsgDepositToEscrow) ValidateBasic() error {
+	if _, err := sdk.AccAddressFromBech32(msg.Signer); err != nil {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidAddress, "invalid signer address: %s", err)
+	}
+
+	if !msg.Amount.IsValid() {
+		return errorsmod.Wrap(sdkerrors.ErrInvalidCoins, msg.Amount.String())
+	}
+
+	if !msg.Amount.IsPositive() {
+		return errorsmod.Wrap(sdkerrors.ErrInvalidCoins, "amount must be positive")
+	}
+
+	if err := validateEscrowDenom(msg.Amount.Denom); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ValidateBasic performs stateless validation for MsgRequestWithdrawal
+func (msg *MsgRequestWithdrawal) ValidateBasic() error {
+	if _, err := sdk.AccAddressFromBech32(msg.Signer); err != nil {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidAddress, "invalid signer address: %s", err)
+	}
+
+	if !msg.Amount.IsValid() {
+		return errorsmod.Wrap(sdkerrors.ErrInvalidCoins, msg.Amount.String())
+	}
+
+	if !msg.Amount.IsPositive() {
+		return errorsmod.Wrap(sdkerrors.ErrInvalidCoins, "amount must be positive")
+	}
+
+	if err := validateEscrowDenom(msg.Amount.Denom); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ValidateBasic performs stateless validation for PaymentPromise
+func (msg *PaymentPromise) ValidateBasic() error {
+	if msg.ChainId == "" {
+		return errorsmod.Wrap(sdkerrors.ErrInvalidRequest, "chain ID cannot be empty")
+	}
+
+	if len(msg.ChainId) > MaxChainIDSize {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "chain ID must be at most %d bytes, got %d", MaxChainIDSize, len(msg.ChainId))
+	}
+
+	if len(msg.Namespace) == 0 {
+		return errorsmod.Wrap(sdkerrors.ErrInvalidRequest, "namespace cannot be empty")
+	}
+
+	if len(msg.Namespace) != share.NamespaceSize {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "namespace must be %d bytes, got %d", share.NamespaceSize, len(msg.Namespace))
+	}
+
+	namespace, err := share.NewNamespaceFromBytes(msg.Namespace)
+	if err != nil {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "invalid namespace: %s", err)
+	}
+
+	if err := namespace.ValidateForBlob(); err != nil {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "invalid blob namespace: %s", err)
+	}
+
+	if msg.BlobSize == 0 {
+		return errorsmod.Wrap(sdkerrors.ErrInvalidRequest, "blob size must be positive")
+	}
+
+	if len(msg.Commitment) != 32 {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "commitment must be 32 bytes, got %d", len(msg.Commitment))
+	}
+
+	if err := validateBlobVersion(msg.BlobVersion); err != nil {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "invalid blob version: %s", err)
+	}
+
+	if msg.Height <= 0 {
+		return errorsmod.Wrap(sdkerrors.ErrInvalidRequest, "height must be positive")
+	}
+
+	if msg.CreationTimestamp.IsZero() {
+		return errorsmod.Wrap(sdkerrors.ErrInvalidRequest, "creation timestamp cannot be zero")
+	}
+
+	if len(msg.SignerPublicKey.Key) != secp256k1.PubKeySize {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidPubKey, "signer public key must be %d bytes, got %d", secp256k1.PubKeySize, len(msg.SignerPublicKey.Key))
+	}
+
+	// Nothing of another length could ever verify: secp256k1 accepts the
+	// compact form only. Rejecting it here keeps 8 MiB of transaction from
+	// reaching any hashing or decoding first.
+	if len(msg.Signature) != PromiseSignatureSize {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "signature must be %d bytes, got %d", PromiseSignatureSize, len(msg.Signature))
+	}
+
+	return nil
+}
+
+// ValidateBasic performs stateless validation for MsgPayForFibre
+func (msg *MsgPayForFibre) ValidateBasic() error {
+	if _, err := sdk.AccAddressFromBech32(msg.Signer); err != nil {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidAddress, "invalid signer address: %s", err)
+	}
+
+	if err := msg.PaymentPromise.ValidateBasic(); err != nil {
+		return errorsmod.Wrap(err, "invalid payment promise")
+	}
+
+	if len(msg.ValidatorSignatures) == 0 {
+		return errorsmod.Wrap(sdkerrors.ErrInvalidRequest, "must have at least one validator signature")
+	}
+
+	if len(msg.ValidatorSignatures) > appconsts.MaxFibreValidatorSignatures {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "too many validator signatures: %d exceeds maximum %d", len(msg.ValidatorSignatures), appconsts.MaxFibreValidatorSignatures)
+	}
+
+	for i, sig := range msg.ValidatorSignatures {
+		if l := len(sig); l != 0 && l != ed25519.SignatureSize {
+			return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "validator signature %d must be empty or %d bytes, got %d", i, ed25519.SignatureSize, l)
+		}
+	}
+
+	return nil
+}
+
+// ValidateBasic performs stateless validation for MsgPaymentPromiseTimeout
+func (msg *MsgPaymentPromiseTimeout) ValidateBasic() error {
+	if _, err := sdk.AccAddressFromBech32(msg.Signer); err != nil {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidAddress, "invalid signer address: %s", err)
+	}
+
+	if err := msg.PaymentPromise.ValidateBasic(); err != nil {
+		return errorsmod.Wrap(err, "invalid payment promise")
+	}
+
+	return nil
+}
+
+// ValidateBasic performs stateless validation for MsgUpdateFibreParams
+func (msg *MsgUpdateFibreParams) ValidateBasic() error {
+	if _, err := sdk.AccAddressFromBech32(msg.Authority); err != nil {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidAddress, "invalid authority address: %s", err)
+	}
+
+	if err := msg.Params.Validate(); err != nil {
+		return errorsmod.Wrap(err, "invalid params")
+	}
+
+	return nil
+}
+
+// validateEscrowDenom rejects any denom other than the bond denom. Escrow
+// balances are charged in the bond denom, and an escrow account takes the denom
+// of its first deposit, so another denom would leave the account unusable.
+func validateEscrowDenom(denom string) error {
+	if denom != appconsts.BondDenom {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidCoins, "denom must be %s, got %s", appconsts.BondDenom, denom)
+	}
+	return nil
+}
+
+func validateBlobVersion(blobVersion uint32) error {
+	if blobVersion != BlobVersionZero {
+		return errorsmod.Wrapf(sdkerrors.ErrInvalidRequest, "unsupported blob version: %d", blobVersion)
+	}
+	return nil
+}

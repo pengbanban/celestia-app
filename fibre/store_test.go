@@ -1,0 +1,663 @@
+package fibre_test
+
+import (
+	"context"
+	"encoding/hex"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/celestiaorg/celestia-app/v11/fibre"
+	"github.com/celestiaorg/celestia-app/v11/pkg/rsema1d/rlc"
+	"github.com/celestiaorg/celestia-app/v11/x/fibre/types"
+	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
+	"github.com/stretchr/testify/require"
+)
+
+func TestStore(t *testing.T) {
+	tests := []struct {
+		name string
+		fn   func(*testing.T, *fibre.Store, string)
+	}{
+		{"PutGet_Roundtrip", testStorePutGetRoundtrip},
+		{"Put_SameCommitmentSamePromise", testStorePutSameCommitmentSamePromise},
+		{"Put_SameCommitmentDifferentPromises", testStorePutSameCommitmentDifferentPromises},
+		{"Put_ConcurrentSameKey", testStorePutConcurrentSameKey},
+		{"Get_NotFound", testStoreGetNotFound},
+		{"Get_DeterministicOrdering", testStoreGetDeterministicOrdering},
+		{"Get_SkipsMissingPayload", testStoreGetSkipsMissingPayload},
+		{"Get_SkipsOrphanToSibling", testStoreGetSkipsOrphanToSibling},
+		{"Get_AllOrphans", testStoreGetAllOrphans},
+		{"PutGet_PreservesRLCs", testStorePutGetPreservesRLCs},
+		{"PruneBefore_RemovesShardAndPromise", testStorePruneBeforeRemovesShardAndPromise},
+		{"PruneBefore_PreservesOtherPromiseShard", testStorePruneBeforePreservesOtherPromiseShard},
+		{"PruneBefore_NonUTCCutoff_DoesNotPruneUnexpired", testStorePruneBeforeNonUTCCutoffDoesNotPruneUnexpired},
+		{"PruneBefore_IdenticalPruneAt", testStorePruneBeforeIdenticalPruneAt},
+		{"Has_PresentAbsentOrphan", testStoreHas},
+		{"Size_EmptyAndSum", testStoreSize},
+		{"PruneBefore_ReturnsFreedBytes", testStorePruneBeforeReturnsFreedBytes},
+		{"DiskAvailable_Positive", testStoreDiskAvailable},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, path := makeTestStore(t)
+			tt.fn(t, store, path)
+		})
+	}
+}
+
+func testStorePutGetRoundtrip(t *testing.T, store *fibre.Store, _ string) {
+	ctx := t.Context()
+
+	blob := makeTestBlobV0(t, 256)
+	shard := makeShardFrom(t, blob, 0, 1, 2)
+	promise := makeTestPaymentPromise(100, blob.ID())
+
+	// put data
+	err := store.Put(ctx, promise, shard, promise.CreationTimestamp)
+	require.NoError(t, err)
+
+	// get shard by commitment
+	gotShard, err := store.Get(ctx, blob.ID().Commitment())
+	require.NoError(t, err)
+	require.Len(t, gotShard.Rows, 3)
+	require.Equal(t, shard.Rows[0].Index, gotShard.Rows[0].Index)
+	require.Equal(t, shard.Rows[1].Index, gotShard.Rows[1].Index)
+	require.Equal(t, shard.Rows[2].Index, gotShard.Rows[2].Index)
+
+	// get payment promise by hash
+	promiseHash, err := promise.Hash()
+	require.NoError(t, err)
+	gotPromise, err := store.GetPaymentPromise(ctx, promiseHash)
+	require.NoError(t, err)
+	require.Equal(t, promise.ChainID, gotPromise.ChainID)
+	require.Equal(t, promise.Height, gotPromise.Height)
+	require.Equal(t, promise.Commitment, gotPromise.Commitment)
+}
+
+func testStorePutGetPreservesRLCs(t *testing.T, store *fibre.Store, _ string) {
+	ctx := t.Context()
+
+	blob := makeTestBlobV0(t, 256)
+	shard := makeShardWithRLC(t, blob, 0, 1, 2)
+	promise := makeTestPaymentPromise(100, blob.ID())
+
+	err := store.Put(ctx, promise, shard, promise.CreationTimestamp)
+	require.NoError(t, err)
+
+	gotShard, err := store.Get(ctx, blob.ID().Commitment())
+	require.NoError(t, err)
+	require.Len(t, gotShard.Rows, 3)
+
+	// RLCs must survive the round-trip
+	require.Equal(t, shard.Rlcs, gotShard.Rlcs,
+		"RLCs should be preserved after store round-trip")
+}
+
+func testStorePutSameCommitmentSamePromise(t *testing.T, store *fibre.Store, _ string) {
+	ctx := t.Context()
+
+	blob := makeTestBlobV0(t, 256)
+	shard := makeShardFrom(t, blob, 0, 1)
+	promise := makeTestPaymentPromise(100, blob.ID())
+
+	// put data first time
+	err := store.Put(ctx, promise, shard, promise.CreationTimestamp)
+	require.NoError(t, err)
+
+	// put the same data again (same commitment, same promise)
+	err = store.Put(ctx, promise, shard, promise.CreationTimestamp)
+	require.NoError(t, err)
+
+	// should be able to retrieve
+	gotShard, err := store.Get(ctx, blob.ID().Commitment())
+	require.NoError(t, err)
+	require.NotNil(t, gotShard)
+	require.Len(t, gotShard.Rows, 2)
+}
+
+func testStorePutSameCommitmentDifferentPromises(t *testing.T, store *fibre.Store, _ string) {
+	ctx := t.Context()
+
+	// create a single blob to get the same commitment
+	blob := makeTestBlobV0(t, 256)
+
+	// extract different shards from the same blob
+	shard1 := makeShardFrom(t, blob, 0, 1)
+	shard2 := makeShardFrom(t, blob, 2, 3)
+
+	// first promise with rows 0, 1
+	promise1 := makeTestPaymentPromise(100, blob.ID())
+
+	// second promise with different height but same commitment, rows 2, 3
+	promise2 := makeTestPaymentPromise(101, blob.ID())
+
+	// put first promise
+	err := store.Put(ctx, promise1, shard1, promise1.CreationTimestamp)
+	require.NoError(t, err)
+
+	// put second promise with same commitment but different promise
+	err = store.Put(ctx, promise2, shard2, promise2.CreationTimestamp)
+	require.NoError(t, err)
+
+	// get returns only first shard found (to prevent unbounded message sizes)
+	gotShard, err := store.Get(ctx, blob.ID().Commitment())
+	require.NoError(t, err)
+	require.NotNil(t, gotShard)
+	require.Len(t, gotShard.Rows, 2, "should have 2 rows from first shard")
+
+	// both promises should be retrievable individually
+	hash1, err := promise1.Hash()
+	require.NoError(t, err)
+	gotPromise1, err := store.GetPaymentPromise(ctx, hash1)
+	require.NoError(t, err)
+	require.Equal(t, promise1.Height, gotPromise1.Height)
+
+	hash2, err := promise2.Hash()
+	require.NoError(t, err)
+	gotPromise2, err := store.GetPaymentPromise(ctx, hash2)
+	require.NoError(t, err)
+	require.Equal(t, promise2.Height, gotPromise2.Height)
+}
+
+// Regression: with a fixed ".tmp" filename, concurrent same-key Puts shared
+// the same tmp file and corrupted each other; one rename also failed ENOENT.
+func testStorePutConcurrentSameKey(t *testing.T, store *fibre.Store, _ string) {
+	ctx := t.Context()
+
+	blob := makeTestBlobV0(t, 256)
+	shard := makeShardFrom(t, blob, 0, 1, 2)
+	promise := makeTestPaymentPromise(100, blob.ID())
+
+	const N = 50
+	var wg sync.WaitGroup
+	errs := make([]error, N)
+	for i := range N {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = store.Put(ctx, promise, shard, promise.CreationTimestamp)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		require.NoError(t, err, "Put #%d", i)
+	}
+	got, err := store.Get(ctx, blob.ID().Commitment())
+	require.NoError(t, err)
+	require.Len(t, got.Rows, len(shard.Rows))
+}
+
+func testStoreGetNotFound(t *testing.T, store *fibre.Store, _ string) {
+	ctx := t.Context()
+
+	// create commitment that was never stored
+	blob := makeTestBlobV0(t, 256)
+
+	// try to get commitment that was never stored
+	_, err := store.Get(ctx, blob.ID().Commitment())
+	require.ErrorIs(t, err, fibre.ErrStoreNotFound)
+}
+
+func testStorePruneBeforeRemovesShardAndPromise(t *testing.T, store *fibre.Store, _ string) {
+	ctx := t.Context()
+
+	blob := makeTestBlobV0(t, 256)
+	shard := makeShardFrom(t, blob, 0, 1)
+	promise := makeTestPaymentPromise(100, blob.ID())
+
+	pruneAt := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	cutoffTime := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	err := store.Put(ctx, promise, shard, pruneAt)
+	require.NoError(t, err)
+
+	// verify exists
+	promiseHash, _ := promise.Hash()
+	_, err = store.GetPaymentPromise(ctx, promiseHash)
+	require.NoError(t, err)
+	_, err = store.Get(ctx, blob.ID().Commitment())
+	require.NoError(t, err)
+
+	// prune
+	pruned, _, err := store.PruneBefore(ctx, cutoffTime)
+	require.NoError(t, err)
+	require.Equal(t, 1, pruned)
+
+	// both promise and shard should be gone
+	_, err = store.GetPaymentPromise(ctx, promiseHash)
+	require.Error(t, err)
+	_, err = store.Get(ctx, blob.ID().Commitment())
+	require.ErrorIs(t, err, fibre.ErrStoreNotFound)
+}
+
+func testStorePruneBeforePreservesOtherPromiseShard(t *testing.T, store *fibre.Store, _ string) {
+	ctx := t.Context()
+
+	blob := makeTestBlobV0(t, 256)
+
+	oldPruneAt := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	cutoffTime := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	newPruneAt := time.Date(2025, 1, 1, 14, 0, 0, 0, time.UTC)
+
+	// two promises with different shards for the same commitment
+	oldPromise := makeTestPaymentPromise(100, blob.ID())
+	newPromise := makeTestPaymentPromise(101, blob.ID())
+	oldShard := makeShardFrom(t, blob, 0, 1)
+	newShard := makeShardFrom(t, blob, 2, 3)
+
+	err := store.Put(ctx, oldPromise, oldShard, oldPruneAt)
+	require.NoError(t, err)
+	err = store.Put(ctx, newPromise, newShard, newPruneAt)
+	require.NoError(t, err)
+
+	oldHash, _ := oldPromise.Hash()
+	newHash, _ := newPromise.Hash()
+
+	// prune old
+	pruned, _, err := store.PruneBefore(ctx, cutoffTime)
+	require.NoError(t, err)
+	require.Equal(t, 1, pruned)
+
+	// old promise gone
+	_, err = store.GetPaymentPromise(ctx, oldHash)
+	require.Error(t, err)
+
+	// new promise and its shard still exist
+	_, err = store.GetPaymentPromise(ctx, newHash)
+	require.NoError(t, err)
+	gotShard, err := store.Get(ctx, blob.ID().Commitment())
+	require.NoError(t, err)
+	require.Equal(t, uint32(2), gotShard.Rows[0].Index)
+}
+
+// testStorePruneBeforeNonUTCCutoffDoesNotPruneUnexpired is a regression test for a timezone bug
+// where PruneBefore would incorrectly prune entries on non-UTC machines.
+func testStorePruneBeforeNonUTCCutoffDoesNotPruneUnexpired(t *testing.T, store *fibre.Store, _ string) {
+	ctx := t.Context()
+
+	blob := makeTestBlobV0(t, 256)
+	shard := makeShardFrom(t, blob, 0, 1)
+	promise := makeTestPaymentPromise(100, blob.ID())
+
+	// entry expires at 19:08 UTC
+	pruneAt := time.Date(2025, 1, 1, 19, 8, 0, 0, time.UTC)
+	err := store.Put(ctx, promise, shard, pruneAt)
+	require.NoError(t, err)
+
+	promiseHash, _ := promise.Hash()
+
+	// cutoff is 19:11 UTC+1 = 18:11 UTC, which is before the entry's expiry of 19:08 UTC.
+	// before the fix, PruneBefore compared the UTC key "202501011908" against the local-formatted
+	// string "202501011911", making the entry appear expired and pruning it incorrectly.
+	utcPlusOne := time.FixedZone("UTC+1", 60*60)
+	cutoff := time.Date(2025, 1, 1, 19, 11, 0, 0, utcPlusOne)
+
+	pruned, _, err := store.PruneBefore(ctx, cutoff)
+	require.NoError(t, err)
+	require.Equal(t, 0, pruned)
+
+	_, err = store.GetPaymentPromise(ctx, promiseHash)
+	require.NoError(t, err)
+}
+
+// Two promises sharing the same pruneAt are both pruned in one pass.
+func testStorePruneBeforeIdenticalPruneAt(t *testing.T, store *fibre.Store, _ string) {
+	ctx := t.Context()
+	blob := makeTestBlobV0(t, 256)
+	pruneAt := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+
+	for _, height := range []uint64{100, 101} {
+		p := makeTestPaymentPromise(height, blob.ID())
+		require.NoError(t, store.Put(ctx, p, makeShardFrom(t, blob, 0, 1), pruneAt))
+	}
+	pruned, _, err := store.PruneBefore(ctx, pruneAt.Add(time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, 2, pruned)
+
+	_, err = store.Get(ctx, blob.ID().Commitment())
+	require.ErrorIs(t, err, fibre.ErrStoreNotFound)
+}
+
+func testStoreGetDeterministicOrdering(t *testing.T, store *fibre.Store, _ string) {
+	ctx := t.Context()
+
+	blob := makeTestBlobV0(t, 256)
+	id := blob.ID()
+
+	// store multiple shards with different row indices
+	for i := range 5 {
+		shard := makeShardFrom(t, blob, i*2, i*2+1)
+		promise := makeTestPaymentPromise(uint64(100+i), id)
+		err := store.Put(ctx, promise, shard, promise.CreationTimestamp)
+		require.NoError(t, err)
+	}
+
+	// get multiple times and verify ordering is deterministic
+	var firstRowIndex uint32
+	for i := range 10 {
+		gotShard, err := store.Get(ctx, id.Commitment())
+		require.NoError(t, err)
+		require.NotEmpty(t, gotShard.Rows)
+
+		if i == 0 {
+			firstRowIndex = gotShard.Rows[0].Index
+		} else {
+			require.Equal(t, firstRowIndex, gotShard.Rows[0].Index,
+				"query ordering should be deterministic - first row index should always be the same")
+		}
+	}
+}
+
+// Reconcile drops staging/ leftovers on open, leaves real shards alone, and
+// logs the cleanup count.
+func TestStoreReconcileStaging(t *testing.T) {
+	cfg := fibre.DefaultStoreConfig()
+	cfg.Path = t.TempDir()
+	store, err := fibre.NewStore(t.Context(), cfg)
+	require.NoError(t, err)
+
+	blob := makeTestBlobV0(t, 256)
+	shard := makeShardFrom(t, blob, 0, 1)
+	promise := makeTestPaymentPromise(100, blob.ID())
+	require.NoError(t, store.Put(t.Context(), promise, shard, promise.CreationTimestamp))
+	require.NoError(t, store.Close())
+
+	stagingDir := filepath.Join(cfg.Path, "staging")
+	require.NoError(t, os.MkdirAll(stagingDir, 0o755))
+	staleA := filepath.Join(stagingDir, "aaa")
+	staleB := filepath.Join(stagingDir, "bbb")
+	require.NoError(t, os.WriteFile(staleA, []byte("partial-a"), 0o644))
+	require.NoError(t, os.WriteFile(staleB, []byte("partial-b"), 0o644))
+
+	var buf strings.Builder
+	cfg.Log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	store, err = fibre.NewStore(t.Context(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+
+	for _, p := range []string{staleA, staleB} {
+		_, err := os.Stat(p)
+		require.True(t, os.IsNotExist(err), "%s should be removed by reconcile", p)
+	}
+	st, err := os.Stat(stagingDir)
+	require.NoError(t, err)
+	require.True(t, st.IsDir())
+
+	out := buf.String()
+	require.Contains(t, out, "store reconcile complete")
+	require.Contains(t, out, "staging_files_removed=2")
+
+	got, err := store.Get(t.Context(), blob.ID().Commitment())
+	require.NoError(t, err)
+	require.Len(t, got.Rows, 2)
+}
+
+// Get skips a marker whose backing file is missing.
+func testStoreGetSkipsMissingPayload(t *testing.T, store *fibre.Store, path string) {
+	blob := makeTestBlobV0(t, 256)
+	shard := makeShardFrom(t, blob, 0, 1)
+	promise := makeTestPaymentPromise(100, blob.ID())
+	require.NoError(t, store.Put(t.Context(), promise, shard, promise.CreationTimestamp))
+	promiseHash, err := promise.Hash()
+	require.NoError(t, err)
+	filePath := filepath.Join(path, "shards", blob.ID().Commitment().String()+"-"+hex.EncodeToString(promiseHash))
+
+	// Simulate "metadata committed, file write never landed".
+	require.NoError(t, os.Remove(filePath))
+
+	_, err = store.Get(t.Context(), blob.ID().Commitment())
+	require.ErrorIs(t, err, fibre.ErrStoreNotFound)
+
+	// A fresh Put with a different promise must still be the one Get finds.
+	promise2 := makeTestPaymentPromise(101, blob.ID())
+	shard2 := makeShardFrom(t, blob, 2, 3)
+	require.NoError(t, store.Put(t.Context(), promise2, shard2, promise2.CreationTimestamp))
+
+	got, err := store.Get(t.Context(), blob.ID().Commitment())
+	require.NoError(t, err)
+	require.Len(t, got.Rows, 2)
+	require.Equal(t, uint32(2), got.Rows[0].Index, "Get should return the new (still-present) shard, not the orphan")
+}
+
+// When iter.First() lands on an orphan marker, Get must skip it and return
+// the lex-next valid sibling for the same commit.
+func testStoreGetSkipsOrphanToSibling(t *testing.T, store *fibre.Store, path string) {
+	blob := makeTestBlobV0(t, 256)
+	p1 := makeTestPaymentPromise(100, blob.ID())
+	p2 := makeTestPaymentPromise(101, blob.ID())
+	s1 := makeShardFrom(t, blob, 0, 1)
+	s2 := makeShardFrom(t, blob, 2, 3)
+	require.NoError(t, store.Put(t.Context(), p1, s1, p1.CreationTimestamp))
+	require.NoError(t, store.Put(t.Context(), p2, s2, p2.CreationTimestamp))
+
+	// Delete the file for whichever promise hashes lex-first so iter.First()
+	// lands on the orphan and forces the fall-through.
+	h1, _ := p1.Hash()
+	h2, _ := p2.Hash()
+	orphan, validRow := h1, s2.Rows[0].Index
+	if hex.EncodeToString(h1) > hex.EncodeToString(h2) {
+		orphan, validRow = h2, s1.Rows[0].Index
+	}
+	require.NoError(t, os.Remove(filepath.Join(path, "shards",
+		blob.ID().Commitment().String()+"-"+hex.EncodeToString(orphan))))
+
+	got, err := store.Get(t.Context(), blob.ID().Commitment())
+	require.NoError(t, err)
+	require.Equal(t, validRow, got.Rows[0].Index)
+}
+
+// If all payloads for a commitment are missing, Get returns NotFound.
+func testStoreGetAllOrphans(t *testing.T, store *fibre.Store, path string) {
+	blob := makeTestBlobV0(t, 256)
+	for i := range 3 {
+		p := makeTestPaymentPromise(uint64(100+i), blob.ID())
+		require.NoError(t, store.Put(t.Context(), p, makeShardFrom(t, blob, 0, 1), p.CreationTimestamp))
+		h, _ := p.Hash()
+		require.NoError(t, os.Remove(filepath.Join(path, "shards",
+			blob.ID().Commitment().String()+"-"+hex.EncodeToString(h))))
+	}
+	_, err := store.Get(t.Context(), blob.ID().Commitment())
+	require.ErrorIs(t, err, fibre.ErrStoreNotFound)
+}
+
+// Has reports present for a stored shard, absent for an unknown promise, and
+// absent (not an error) for an orphan marker whose file is gone.
+func testStoreHas(t *testing.T, store *fibre.Store, path string) {
+	ctx := t.Context()
+	blob := makeTestBlobV0(t, 256)
+	promise := makeTestPaymentPromise(100, blob.ID())
+	require.NoError(t, store.Put(ctx, promise, makeShardFrom(t, blob, 0, 1), promise.CreationTimestamp))
+
+	commitment := blob.ID().Commitment()
+	promiseHash, err := promise.Hash()
+	require.NoError(t, err)
+
+	// present
+	has, err := store.Has(ctx, commitment, promiseHash)
+	require.NoError(t, err)
+	require.True(t, has)
+
+	// unknown promise for the same commitment
+	otherHash, err := makeTestPaymentPromise(200, blob.ID()).Hash()
+	require.NoError(t, err)
+	has, err = store.Has(ctx, commitment, otherHash)
+	require.NoError(t, err)
+	require.False(t, has)
+
+	// orphan: marker present, file gone -> absent, no error
+	require.NoError(t, os.Remove(filepath.Join(path, "shards",
+		commitment.String()+"-"+hex.EncodeToString(promiseHash))))
+	has, err = store.Has(ctx, commitment, promiseHash)
+	require.NoError(t, err)
+	require.False(t, has, "orphan marker without a file must report absent, not error")
+}
+
+// Size is 0 for an empty store and otherwise sums shard marker sizes.
+func testStoreSize(t *testing.T, store *fibre.Store, path string) {
+	ctx := t.Context()
+
+	size, err := store.Size(ctx)
+	require.NoError(t, err)
+	require.Zero(t, size, "empty store must report 0, not an error")
+
+	canceledEmptyCtx, cancelEmpty := context.WithCancel(ctx)
+	cancelEmpty()
+	size, err = store.Size(canceledEmptyCtx)
+	require.Zero(t, size)
+	require.ErrorIs(t, err, context.Canceled)
+
+	blob := makeTestBlobV0(t, 256)
+	commitment := blob.ID().Commitment()
+	var want int64
+	for i, rows := range [][]int{{0, 1}, {2, 3}} {
+		p := makeTestPaymentPromise(uint64(100+i), blob.ID())
+		require.NoError(t, store.Put(ctx, p, makeShardFrom(t, blob, rows...), p.CreationTimestamp))
+		h, err := p.Hash()
+		require.NoError(t, err)
+		info, err := os.Stat(filepath.Join(path, "shards", commitment.String()+"-"+hex.EncodeToString(h)))
+		require.NoError(t, err)
+		want += info.Size()
+	}
+
+	size, err = store.Size(ctx)
+	require.NoError(t, err)
+	require.Equal(t, want, size)
+
+	// Versioned markers remain accounted when a local payload is missing.
+	h, err := makeTestPaymentPromise(100, blob.ID()).Hash()
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(filepath.Join(path, "shards", commitment.String()+"-"+hex.EncodeToString(h))))
+	size, err = store.Size(ctx)
+	require.NoError(t, err)
+	require.Equal(t, want, size)
+
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	size, err = store.Size(canceledCtx)
+	require.Zero(t, size)
+	require.ErrorIs(t, err, context.Canceled)
+
+	// Cancelling mid-scan, after the entry guard has already passed, must also
+	// surface context.Canceled rather than a nil error and a partial total.
+	size, err = store.Size(&cancelAfterCtx{Context: ctx, live: 1})
+	require.Zero(t, size)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+// cancelAfterCtx reports a live context for its first `live` Err checks and a
+// cancelled one from then on, so a test can land the cancellation between
+// Store.Size's entry guard and its shard scan deterministically.
+type cancelAfterCtx struct {
+	context.Context
+	live int
+}
+
+func (c *cancelAfterCtx) Err() error {
+	if c.live > 0 {
+		c.live--
+		return nil
+	}
+	return context.Canceled
+}
+
+// PruneBefore reports the total marker-accounted bytes it freed.
+func testStorePruneBeforeReturnsFreedBytes(t *testing.T, store *fibre.Store, path string) {
+	ctx := t.Context()
+	blob := makeTestBlobV0(t, 256)
+	commitment := blob.ID().Commitment()
+
+	pruneAt := time.Date(2025, 1, 1, 10, 0, 0, 0, time.UTC)
+	cutoffTime := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	var want int64
+	for i, rows := range [][]int{{0, 1}, {2, 3}} {
+		p := makeTestPaymentPromise(uint64(100+i), blob.ID())
+		require.NoError(t, store.Put(ctx, p, makeShardFrom(t, blob, rows...), pruneAt))
+		h, err := p.Hash()
+		require.NoError(t, err)
+		info, err := os.Stat(filepath.Join(path, "shards", commitment.String()+"-"+hex.EncodeToString(h)))
+		require.NoError(t, err)
+		want += info.Size()
+	}
+
+	pruned, freed, err := store.PruneBefore(ctx, cutoffTime)
+	require.NoError(t, err)
+	require.Equal(t, 2, pruned)
+	require.Equal(t, want, freed)
+
+	// everything pruned -> store empty
+	size, err := store.Size(ctx)
+	require.NoError(t, err)
+	require.Zero(t, size)
+}
+
+// DiskAvailable reports the free bytes on the store's filesystem.
+func testStoreDiskAvailable(t *testing.T, store *fibre.Store, _ string) {
+	avail, err := store.DiskAvailable()
+	require.NoError(t, err)
+	require.Positive(t, avail)
+}
+
+func makeTestStore(t *testing.T) (*fibre.Store, string) {
+	t.Helper()
+	cfg := fibre.DefaultStoreConfig()
+	cfg.Path = t.TempDir()
+	store, err := fibre.NewStore(t.Context(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+	return store, cfg.Path
+}
+
+// makeShardFrom extracts a shard from a blob at the given row indices.
+func makeShardFrom(t *testing.T, blob *fibre.Blob, indices ...int) *types.BlobShard {
+	t.Helper()
+
+	rows := make([]*types.BlobRow, 0, len(indices))
+	require.NoError(t, blob.RowProofs(indices, func(index int, row []byte, proof [][]byte) {
+		rows = append(rows, &types.BlobRow{
+			Index: uint32(index),
+			Data:  row,
+			Proof: proof,
+		})
+	}))
+
+	return &types.BlobShard{
+		Rows: rows,
+	}
+}
+
+// makeShardWithRLC extracts a shard from a blob at the given row indices,
+// including its RLC vector.
+func makeShardWithRLC(t *testing.T, blob *fibre.Blob, indices ...int) *types.BlobShard {
+	t.Helper()
+	shard := makeShardFrom(t, blob, indices...)
+
+	shard.Rlcs = rlc.Marshal(blob.RLC())
+
+	return shard
+}
+
+var testSignerKey = secp256k1.GenPrivKey().PubKey().(*secp256k1.PubKey)
+
+// makeTestPaymentPromise creates a test payment promise for store tests.
+func makeTestPaymentPromise(height uint64, blobID fibre.BlobID) *fibre.PaymentPromise {
+	return &fibre.PaymentPromise{
+		ChainID:           "test-chain",
+		Height:            height,
+		Namespace:         testNamespace,
+		UploadSize:        1024,
+		BlobVersion:       uint32(blobID.Version()),
+		Commitment:        blobID.Commitment(),
+		CreationTimestamp: time.Date(2025, 10, 21, 15, 30, 0, 0, time.UTC),
+		SignerKey:         testSignerKey,
+		Signature:         []byte("test-signature-64-bytes-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+	}
+}

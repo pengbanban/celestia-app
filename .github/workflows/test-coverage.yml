@@ -1,0 +1,122 @@
+name: test-coverage
+
+# Full profiles on main seed the base for merge-queue non-regression checks.
+# PRs keep the required shard statuses but run the ordinary Go tests instead.
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+    branches: ["main"]
+  merge_group:
+  workflow_dispatch:
+
+concurrency:
+  group: test-coverage-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The serial suite takes over 30 minutes on one runner, so run its slowest
+  # packages on separate runners. Shard names come from scripts/test_cover.sh;
+  # the merge job fails if this list misses one.
+  test-coverage-shard:
+    name: test-coverage-shard (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [app-test, fibre-tools, rest, txsim, user]
+    steps:
+      # Keep the matrix expanded on PRs so every required shard name reports.
+      # A job-level condition would skip the matrix before expansion.
+      - name: Defer coverage to the merge queue
+        if: github.event_name == 'pull_request'
+        run: echo "PR Go tests run in ci-release; coverage runs on the combined merge result."
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+        if: github.event_name != 'pull_request'
+
+      - uses: ./.github/actions/setup-go
+        if: github.event_name != 'pull_request'
+
+      - name: Generate shard coverage.txt
+        if: github.event_name != 'pull_request'
+        env:
+          COVER_SHARD: ${{ matrix.shard }}
+        run: make test-coverage
+
+      - name: Save shard coverage
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: coverage.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  test-coverage:
+    if: github.event_name != 'pull_request'
+    needs: test-coverage-shard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+
+      - uses: ./.github/actions/setup-go
+
+      - name: Download shard coverage
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 #v8.0.2
+        with:
+          pattern: coverage-shard-*
+          path: shards
+
+      - name: Merge shard coverage
+        run: |
+          profiles=()
+          for shard in $(bash scripts/test_cover.sh --list-shards); do
+            profile="shards/coverage-shard-$shard/coverage.txt"
+            if [ ! -f "$profile" ]; then
+              echo "::error::Missing coverage for shard $shard. Add it to the test-coverage-shard matrix."
+              exit 1
+            fi
+            profiles+=("$profile")
+          done
+          bash scripts/merge_coverage.sh coverage.txt "${profiles[@]}"
+
+      - name: Verify proposal handler instrumentation
+        shell: bash
+        run: bash scripts/check_proposal_coverage.sh | tee coverage-summary.txt
+
+      - name: Publish coverage summary
+        if: always()
+        run: |
+          if [ -f coverage-summary.txt ]; then
+            {
+              echo '```text'
+              cat coverage-summary.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Save coverage reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 #v7.0.2
+        with:
+          name: coverage
+          path: |
+            coverage.txt
+            coverage-summary.txt
+          if-no-files-found: ignore
+
+      - name: Upload coverage.txt
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 #v7.1.1
+        with:
+          disable_search: true
+          fail_ci_if_error: true
+          files: ./coverage.txt
+          # This job does not run on PRs, so fork tokenless uploads never apply.
+          use_oidc: true

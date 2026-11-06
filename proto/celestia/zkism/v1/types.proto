@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package celestia.zkism.v1;
+
+option go_package = "github.com/celestiaorg/celestia-app/x/zkism/types";
+
+import "cosmos_proto/cosmos.proto";
+import "gogoproto/gogo.proto";
+
+// InterchainSecurityModule defines the Hyperlane interchain security module (ISM).
+message InterchainSecurityModule {
+  option (gogoproto.goproto_getters) = false;
+
+  // unique hyperlane identifier
+  string id = 1 [
+    (gogoproto.customtype) = "github.com/bcp-innovations/hyperlane-cosmos/util.HexAddress",
+    (gogoproto.nullable)   = false
+  ];
+  // the owner or creator of the ism
+  string owner = 2 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  // current state
+  bytes state = 3;
+  // merkle tree address in bytes32 format
+  bytes merkle_tree_address = 4;
+  // the sp1 groth16 verifier key
+  bytes groth16_vkey = 5;
+  // hash-based commitment to the verifier key used for state transition
+  bytes state_transition_vkey = 6;
+  // hash-based commitment to the verifier key used for state membership
+  bytes state_membership_vkey = 7;
+  // number of replaced state roots and merkle tree states kept as history; 0 means DefaultRootHistorySize
+  uint32 root_history_size = 8;
+  // block height of the last accepted state transition proof; 0 if none. At most one is accepted per block.
+  int64 state_height = 9;
+}
+
+// MerkleTreeState is the source chain Hyperlane merkle tree state proven for an ISM.
+message MerkleTreeState {
+  // root of the source chain merkle tree
+  bytes root = 1;
+  // number of leaves inserted into the source chain merkle tree
+  uint32 count = 2;
+  // block height at which the merkle tree state was proven. At most one membership proof is accepted per block.
+  int64 height = 3;
+}
+
+// RootHistoryEntry is a state root or merkle tree state that was replaced and is still accepted.
+message RootHistoryEntry {
+  // state root, or merkle tree root for merkle tree state history
+  bytes root = 1;
+  // number of leaves in the merkle tree; always 0 for state root history
+  uint32 count = 2;
+  // block height at which the entry was replaced
+  int64 height = 3;
+}

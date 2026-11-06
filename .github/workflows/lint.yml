@@ -1,0 +1,118 @@
+name: lint
+on:
+  workflow_call:
+
+jobs:
+  golangci-lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d #v4.0.3
+        id: changes
+        with:
+          token: ''
+          base: ${{ github.event_name == 'push' && github.ref || '' }}
+          filters: |
+            go:
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+      - uses: ./.github/actions/setup-go
+        if: steps.changes.outputs.go == 'true'
+        with:
+          golangci-lint-cache: true
+      - run: go tool golangci-lint run --timeout 10m
+        if: steps.changes.outputs.go == 'true'
+
+  govulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+      - uses: ./.github/actions/setup-go
+      - run: make govulncheck
+
+  hadolint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d #v4.0.3
+        id: changes
+        with:
+          token: ''
+          base: ${{ github.event_name == 'push' && github.ref || '' }}
+          filters: |
+            docker:
+              - 'docker/**'
+      - uses: hadolint/hadolint-action@v3.5.0
+        if: steps.changes.outputs.docker == 'true'
+        with:
+          dockerfile: docker/standalone.Dockerfile
+      - uses: hadolint/hadolint-action@v3.5.0
+        if: steps.changes.outputs.docker == 'true'
+        with:
+          dockerfile: docker/multiplexer.Dockerfile
+      - uses: hadolint/hadolint-action@v3.5.0
+        if: steps.changes.outputs.docker == 'true'
+        with:
+          dockerfile: docker/e2e.Dockerfile
+      - uses: hadolint/hadolint-action@v3.5.0
+        if: steps.changes.outputs.docker == 'true'
+        with:
+          dockerfile: docker/txsim/Dockerfile
+
+  go-mod-tidy-check:
+    name: go-mod-tidy-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+      - uses: ./.github/actions/setup-go
+      - name: Check go mod tidy
+        run: |
+          # `go mod tidy -diff` exits non-zero for ANY error, including transient
+          # module download failures from the Go proxy, not only when a genuine
+          # diff exists. Retry a few times before declaring a module dirty: a
+          # network blip succeeds on retry, while a genuine diff fails every
+          # attempt and is still caught. See #7380.
+          DIRTY=""
+          MAX_ATTEMPTS=3
+          for moddir in $(find . -name 'go.mod' -exec dirname {} \;); do
+            echo "Checking $moddir"
+            attempt=1
+            until (cd "$moddir" && go mod tidy -diff); do
+              if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+                DIRTY="$DIRTY $moddir"
+                break
+              fi
+              echo "go mod tidy -diff failed for $moddir (attempt $attempt/$MAX_ATTEMPTS); retrying after backoff..."
+              sleep $((attempt * 5))
+              attempt=$((attempt + 1))
+            done
+          done
+          if [ -n "$DIRTY" ]; then
+            echo "ERROR: go mod tidy produced changes in:$DIRTY"
+            echo "Run 'make mod' and commit the changes."
+            exit 1
+          fi
+
+  yamllint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d #v4.0.3
+        id: changes
+        with:
+          token: ''
+          base: ${{ github.event_name == 'push' && github.ref || '' }}
+          filters: |
+            yaml:
+              - '**/*.yml'
+              - '**/*.yaml'
+      - name: Run yamllint
+        if: steps.changes.outputs.yaml == 'true'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/yamllint"
+          "$RUNNER_TEMP/yamllint/bin/pip" install yamllint==1.38.0
+          "$RUNNER_TEMP/yamllint/bin/yamllint" --no-warnings .

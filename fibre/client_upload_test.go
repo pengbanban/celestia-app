@@ -1,0 +1,451 @@
+package fibre_test
+
+import (
+	"context"
+	"crypto/ed25519"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"github.com/celestiaorg/celestia-app/v11/fibre"
+	"github.com/celestiaorg/celestia-app/v11/fibre/internal/grpc"
+	"github.com/celestiaorg/celestia-app/v11/fibre/state"
+	"github.com/celestiaorg/celestia-app/v11/fibre/validator"
+	"github.com/celestiaorg/celestia-app/v11/pkg/rsema1d"
+	"github.com/celestiaorg/celestia-app/v11/x/fibre/types"
+	cmted25519 "github.com/cometbft/cometbft/crypto/ed25519"
+	cmtmath "github.com/cometbft/cometbft/libs/math"
+	core "github.com/cometbft/cometbft/types"
+	"github.com/stretchr/testify/require"
+	grpclib "google.golang.org/grpc"
+)
+
+func TestClientUpload(t *testing.T) {
+	tests := []struct {
+		name string
+		fn   func(*testing.T)
+	}{
+		{"Concurrent", testClientConcurrentUploads},
+		{"ContextCancellation", testClientUploadContextCancellation},
+		{"SucceedsWith1/3Failures", testClientUploadSucceedsWithOneThirdFailures},
+		{"InsufficientVotingPower", testClientUploadInsufficientVotingPower},
+		{"AllValidatorsReceiveData", testClientUploadAllValidatorsReceiveData},
+		{"AwaitAllSignatures", testClientUploadAwaitAllSignatures},
+		{"ClosedClient", testClientUploadClosedClient},
+		{"NoKeyring", testClientUploadNoKeyring},
+		{"ReUpload", testClientReUpload},
+		{"AfterFree", testClientUploadAfterFree},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, tt.fn)
+	}
+}
+
+func testClientConcurrentUploads(t *testing.T) {
+	client := makeTestUploadClient(t, 100, nil)
+	t.Cleanup(func() { require.NoError(t, client.Stop(t.Context())) })
+
+	const numConcurrent = 5
+
+	var wg sync.WaitGroup
+	commitments := make(chan rsema1d.Commitment, numConcurrent)
+
+	for range numConcurrent {
+		wg.Go(func() {
+			blob := makeTestBlobV0(t, 256*1024)
+			defer blob.Free()
+			result, err := client.Upload(t.Context(), testNamespace, blob)
+			require.NoError(t, err)
+
+			commitments <- result.Commitment
+		})
+	}
+
+	wg.Wait()
+	close(commitments)
+	require.Len(t, commitments, numConcurrent)
+}
+
+func testClientUploadNoKeyring(t *testing.T) {
+	cfg := fibre.DefaultClientConfig()
+	cfg.StateClientFn = func() (state.Client, error) {
+		return &mockStateClient{chainID: "celestia"}, nil
+	}
+	client, err := fibre.NewClient(nil, cfg)
+	require.NoError(t, err)
+	blob := makeTestBlobV0(t, 256*1024)
+
+	// Lifecycle errors take precedence over the missing keyring.
+	_, err = client.Upload(t.Context(), testNamespace, blob)
+	require.ErrorContains(t, err, "client is not started")
+
+	require.NoError(t, client.Start(t.Context()))
+	_, err = client.Upload(t.Context(), testNamespace, blob)
+	require.ErrorIs(t, err, fibre.ErrNoKeyring)
+
+	require.NoError(t, client.Stop(t.Context()))
+	_, err = client.Upload(t.Context(), testNamespace, blob)
+	require.ErrorIs(t, err, fibre.ErrClientClosed)
+}
+
+func testClientUploadContextCancellation(t *testing.T) {
+	var calls atomic.Int64
+	client := makeTestUploadClient(t, 100, func(cfg *fibre.ClientConfig) {
+		newClient := cfg.NewClientFn
+		cfg.NewClientFn = func(ctx context.Context, val *core.Validator) (grpc.Client, error) {
+			client, err := newClient(ctx, val)
+			if err != nil {
+				return nil, err
+			}
+			return uploadAttemptClient{Client: client, calls: &calls}, nil
+		}
+	})
+	t.Cleanup(func() { require.NoError(t, client.Stop(t.Context())) })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	blob := makeTestBlobV0(t, 1024*1024)
+	defer blob.Free()
+
+	_, err := client.Upload(ctx, testNamespace, blob)
+	require.ErrorIs(t, err, context.Canceled)
+	client.Await()
+	require.Zero(t, calls.Load(), "cancelled uploads must not dispatch shards")
+}
+
+// uploadAttemptClient counts attempts even when the RPC fails or is cancelled.
+type uploadAttemptClient struct {
+	grpc.Client
+	calls *atomic.Int64
+}
+
+func (c uploadAttemptClient) UploadShard(ctx context.Context, req *types.UploadShardRequest, opts ...grpclib.CallOption) (*types.UploadShardResponse, error) {
+	c.calls.Add(1)
+	return c.Client.UploadShard(ctx, req, opts...)
+}
+
+func testClientUploadSucceedsWithOneThirdFailures(t *testing.T) {
+	const numValidators = 100
+	client := makeTestUploadClient(t, numValidators, func(cfg *fibre.ClientConfig) {
+		cfg.NewClientFn = failingClientFn(33, cfg.NewClientFn) // Fail 1/3 of validators
+	})
+	t.Cleanup(func() { require.NoError(t, client.Stop(t.Context())) })
+
+	blob := makeTestBlobV0(t, 256*1024)
+	defer blob.Free()
+
+	result, err := client.Upload(t.Context(), testNamespace, blob)
+	require.NoError(t, err)
+	require.NotEmpty(t, result.ValidatorSignatures)
+	require.GreaterOrEqual(t, len(result.ValidatorSignatures), 67, "should have at least 2/3 signatures")
+}
+
+func testClientUploadInsufficientVotingPower(t *testing.T) {
+	const numValidators = 100
+	client := makeTestUploadClient(t, numValidators, func(cfg *fibre.ClientConfig) {
+		cfg.NewClientFn = failingClientFn(34, cfg.NewClientFn) // Fail 1/3+1 validators (34/100)
+	})
+	t.Cleanup(func() { require.NoError(t, client.Stop(t.Context())) })
+
+	blob := makeTestBlobV0(t, 512*1024)
+	defer blob.Free()
+
+	_, err := client.Upload(t.Context(), testNamespace, blob)
+	require.Error(t, err)
+
+	var notEnoughSigsErr *validator.NotEnoughSignaturesError
+	require.ErrorAs(t, err, &notEnoughSigsErr, "expected NotEnoughSignaturesError")
+	require.Less(t, notEnoughSigsErr.CollectedPower, notEnoughSigsErr.RequiredPower, "collected power should be less than required")
+}
+
+func testClientUploadAllValidatorsReceiveData(t *testing.T) {
+	const numValidators = 100
+
+	var counter *atomic.Int64
+	client := makeTestUploadClient(t, numValidators, func(cfg *fibre.ClientConfig) {
+		cfg.NewClientFn, counter = countingClientFn(cfg.NewClientFn)
+	})
+	t.Cleanup(func() { require.NoError(t, client.Stop(t.Context())) })
+
+	blob := makeTestBlobV0(t, 256*1024)
+	defer blob.Free()
+	_, err := client.Upload(t.Context(), testNamespace, blob)
+	require.NoError(t, err)
+
+	// Stop drains background goroutines so all peers receive data.
+	require.NoError(t, client.Stop(t.Context()))
+
+	// verify all validators received data
+	require.Equal(t, numValidators, int(counter.Load()), "not all validators received data")
+}
+
+func testClientUploadAwaitAllSignatures(t *testing.T) {
+	const numValidators = 100
+
+	var counter *atomic.Int64
+	client := makeTestUploadClient(t, numValidators, func(cfg *fibre.ClientConfig) {
+		cfg.NewClientFn, counter = countingClientFn(cfg.NewClientFn)
+	})
+	t.Cleanup(func() { require.NoError(t, client.Stop(t.Context())) })
+
+	blob := makeTestBlobV0(t, 256*1024)
+	defer blob.Free()
+	result, err := client.Upload(t.Context(), testNamespace, blob, fibre.WithAwaitAllSignatures())
+	require.NoError(t, err)
+
+	// WithAwaitAllSignatures waits for all responses, so all validators
+	// must have been contacted by the time Upload returns — without needing Stop.
+	require.Equal(t, numValidators, int(counter.Load()), "all validators should have been contacted before Upload returned")
+	var nonNilSigs int
+	for _, sig := range result.ValidatorSignatures {
+		if sig != nil {
+			nonNilSigs++
+		}
+	}
+	require.Equal(t, numValidators, nonNilSigs, "should have non-nil signatures from all validators")
+}
+
+func testClientUploadClosedClient(t *testing.T) {
+	client := makeTestUploadClient(t, 100, nil)
+
+	// close the client
+	require.NoError(t, client.Stop(t.Context()))
+	// close again - should be idempotent
+	require.NoError(t, client.Stop(t.Context()))
+
+	blob := makeTestBlobV0(t, 256*1024)
+	defer blob.Free()
+
+	// attempt to upload after closing
+	_, err := client.Upload(t.Context(), testNamespace, blob)
+	require.ErrorIs(t, err, fibre.ErrClientClosed, "expected ErrClientClosed when uploading to closed client")
+}
+
+// testClientReUpload verifies that the same live blob can be uploaded
+// concurrently more than once — each Upload retains/releases an independent
+// internal reference, so the asm slab stays alive across all of them and is
+// released exactly once at Free.
+func testClientReUpload(t *testing.T) {
+	client := makeTestUploadClient(t, 100, nil)
+	t.Cleanup(func() { require.NoError(t, client.Stop(t.Context())) })
+
+	blob := makeTestBlobV0(t, 256*1024)
+	defer blob.Free()
+
+	const numConcurrent = 8
+	var wg sync.WaitGroup
+	for range numConcurrent {
+		wg.Go(func() {
+			result, err := client.Upload(t.Context(), testNamespace, blob)
+			require.NoError(t, err)
+			require.Equal(t, blob.ID().Commitment(), result.Commitment)
+		})
+	}
+	wg.Wait()
+}
+
+// testClientUploadAfterFree verifies that uploading a blob whose pooled storage
+// was already released fails fast rather than reading recycled memory. The
+// error is intentionally opaque (not a matchable sentinel) — it signals a
+// use-after-free bug in the caller, which has no sane recovery.
+func testClientUploadAfterFree(t *testing.T) {
+	client := makeTestUploadClient(t, 100, nil)
+	t.Cleanup(func() { require.NoError(t, client.Stop(t.Context())) })
+
+	blob := makeTestBlobV0(t, 256*1024)
+	blob.Free()
+
+	_, err := client.Upload(t.Context(), testNamespace, blob)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "already released")
+}
+
+// makeTestUploadClient creates an upload client for testing.
+func makeTestUploadClient(t *testing.T, numValidators int, customCfg func(*fibre.ClientConfig)) *fibre.Client {
+	t.Helper()
+
+	cfg := fibre.DefaultClientConfig()
+	validators, privKeys := makeTestValidators(t, numValidators)
+	cfg.NewClientFn = makeMockClientFn(validators, privKeys)
+	if customCfg != nil {
+		customCfg(&cfg)
+	}
+
+	valSet := validator.Set{ValidatorSet: core.NewValidatorSet(validators), Height: 100}
+	cfg.StateClientFn = func() (state.Client, error) {
+		return &mockStateClient{SetGetter: &mockValidatorSetGetter{set: valSet}, chainID: "celestia"}, nil
+	}
+	client, err := fibre.NewClient(makeTestKeyring(t), cfg)
+	require.NoError(t, err)
+	require.NoError(t, client.Start(t.Context()))
+	return client
+}
+
+// mock infrastructure
+
+func makeMockClientFn(validators []*core.Validator, privKeys []cmted25519.PrivKey) grpc.NewClientFn {
+	privKeyMap := make(map[string]cmted25519.PrivKey)
+	for i, val := range validators {
+		privKeyMap[val.Address.String()] = privKeys[i]
+	}
+
+	return func(ctx context.Context, val *core.Validator) (grpc.Client, error) {
+		privKey, ok := privKeyMap[val.Address.String()]
+		if !ok {
+			return nil, fmt.Errorf("no private key found for validator %s", val.Address)
+		}
+
+		return &validatorMockClient{
+			validator: val,
+			privKey:   privKey,
+		}, nil
+	}
+}
+
+type validatorMockClient struct {
+	validator *core.Validator
+	privKey   cmted25519.PrivKey
+}
+
+func (v *validatorMockClient) UploadShard(ctx context.Context, req *types.UploadShardRequest, opts ...grpclib.CallOption) (*types.UploadShardResponse, error) {
+	var pp fibre.PaymentPromise
+	if err := pp.FromProto(req.Promise); err != nil {
+		return nil, err
+	}
+
+	signBytes, err := pp.SignBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	privKeyBytes := v.privKey.Bytes()
+	if len(privKeyBytes) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("invalid private key size: got %d, want %d", len(privKeyBytes), ed25519.PrivateKeySize)
+	}
+
+	return &types.UploadShardResponse{
+		ValidatorSignature: ed25519.Sign(ed25519.PrivateKey(privKeyBytes), signBytes),
+	}, nil
+}
+
+func (v *validatorMockClient) DownloadShard(ctx context.Context, req *types.DownloadShardRequest, opts ...grpclib.CallOption) (*types.DownloadShardResponse, error) {
+	return &types.DownloadShardResponse{}, nil
+}
+
+func (v *validatorMockClient) Close() error {
+	return nil
+}
+
+// heightStampingSetGetter mirrors the real getters: GetByHeight returns the
+// set stamped with the requested height.
+type heightStampingSetGetter struct {
+	set validator.Set
+}
+
+func (m *heightStampingSetGetter) Head(context.Context) (validator.Set, error) {
+	return m.set, nil
+}
+
+func (m *heightStampingSetGetter) GetByHeight(_ context.Context, height uint64) (validator.Set, error) {
+	return validator.Set{ValidatorSet: m.set.ValidatorSet, Height: height}, nil
+}
+
+// TestUploadSignsAtHead pins the signing height: promises must be signed at
+// the head, whose validator set is the one the upload fans out to. Fails if
+// the signing height silently drifts (e.g. to head-1, see #7774/#7775).
+func TestUploadSignsAtHead(t *testing.T) {
+	const head = uint64(100)
+
+	cfg := fibre.DefaultClientConfig()
+	validators, privKeys := makeTestValidators(t, 3)
+	cfg.NewClientFn = makeMockClientFn(validators, privKeys)
+	cfg.StateClientFn = func() (state.Client, error) {
+		getter := &heightStampingSetGetter{
+			set: validator.Set{ValidatorSet: core.NewValidatorSet(validators), Height: head},
+		}
+		return &mockStateClient{SetGetter: getter, chainID: "celestia"}, nil
+	}
+	client, err := fibre.NewClient(makeTestKeyring(t), cfg)
+	require.NoError(t, err)
+	require.NoError(t, client.Start(t.Context()))
+	t.Cleanup(func() { require.NoError(t, client.Stop(t.Context())) })
+
+	blob := makeTestBlobV0(t, 1024)
+	defer blob.Free()
+
+	result, err := client.Upload(t.Context(), testNamespace, blob)
+	require.NoError(t, err)
+	require.Equal(t, head, result.Height)
+}
+
+// divergentSetGetter returns different validator sets for the head and for any
+// other height, simulating a validator-set change between adjacent heights.
+type divergentSetGetter struct {
+	head  validator.Set
+	other *core.ValidatorSet
+}
+
+func (m *divergentSetGetter) Head(context.Context) (validator.Set, error) {
+	return m.head, nil
+}
+
+func (m *divergentSetGetter) GetByHeight(_ context.Context, height uint64) (validator.Set, error) {
+	if height == m.head.Height {
+		return validator.Set{ValidatorSet: m.head.ValidatorSet, Height: height}, nil
+	}
+	return validator.Set{ValidatorSet: m.other, Height: height}, nil
+}
+
+// TestUploadSignaturesVerifyAtPromiseHeight replays the on-chain check: the
+// collected signatures must verify positionally against the validator set at
+// the promise's height (x/fibre validateValidatorSignatures). Any pairing
+// drift between the set the upload fans out to and the height stamped into the
+// promise fails this test, even when the sets differ between adjacent heights
+// (the defect a caching relabel introduced in #7775).
+func TestUploadSignaturesVerifyAtPromiseHeight(t *testing.T) {
+	const head = uint64(100)
+
+	headVals, headKeys := makeTestValidators(t, 4)
+	otherVals, _ := makeTestValidators(t, 4)
+
+	getter := &divergentSetGetter{
+		head:  validator.Set{ValidatorSet: core.NewValidatorSet(headVals), Height: head},
+		other: core.NewValidatorSet(otherVals),
+	}
+
+	cfg := fibre.DefaultClientConfig()
+	cfg.NewClientFn = makeMockClientFn(headVals, headKeys)
+	cfg.StateClientFn = func() (state.Client, error) {
+		return &mockStateClient{SetGetter: getter, chainID: "celestia"}, nil
+	}
+	client, err := fibre.NewClient(makeTestKeyring(t), cfg)
+	require.NoError(t, err)
+	require.NoError(t, client.Start(t.Context()))
+	t.Cleanup(func() { require.NoError(t, client.Stop(t.Context())) })
+
+	blob := makeTestBlobV0(t, 1024)
+	defer blob.Free()
+
+	result, err := client.Upload(t.Context(), testNamespace, blob, fibre.WithAwaitAllSignatures())
+	require.NoError(t, err)
+
+	// The chain resolves the set at the promise's height; replay that here.
+	verifySet, err := getter.GetByHeight(t.Context(), result.Height)
+	require.NoError(t, err)
+	signBytes, err := result.SignBytes()
+	require.NoError(t, err)
+
+	sigSet := verifySet.NewSignatureSet(cmtmath.Fraction{Numerator: 2, Denominator: 3}, signBytes)
+	for i, sig := range result.ValidatorSignatures {
+		if len(sig) == 0 {
+			continue
+		}
+		_, err := sigSet.Add(verifySet.Validators[i], sig)
+		require.NoError(t, err, "signature %d does not verify against the set at promise height %d", i, result.Height)
+	}
+	_, err = sigSet.Signatures()
+	require.NoError(t, err, "signatures do not reach quorum against the set at promise height %d", result.Height)
+}
